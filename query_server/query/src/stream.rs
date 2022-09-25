@@ -92,7 +92,7 @@ impl Stream for TableScanStream {
             rt.block_on(async move {
                 //todo: for test, it will remove after predicate done
                 let sids = store_engine
-                    .get_series_id_list(&db_name, &table_name, &vec![])
+                    .get_series_id_list(&db_name, &table_name, &[])
                     .await
                     .unwrap();
 
@@ -363,7 +363,7 @@ fn build_field_array(
 }
 
 fn make_record_batch(
-    db_name: &String,
+    db_name: &str,
     block_map: HashMap<SeriesId, HashMap<u32, Vec<DataBlock>>>,
     store_engine: EngineRef,
     proj_schema: SchemaRef,
@@ -453,7 +453,7 @@ fn make_time_col_if_need(
 }
 
 fn make_tag_col(
-    db_name: &String,
+    db_name: &str,
     store_engine: EngineRef,
     sid: SeriesId,
     len: usize,

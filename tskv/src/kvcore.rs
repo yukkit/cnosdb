@@ -141,7 +141,7 @@ impl TsKv {
 
     pub fn read_point(
         &self,
-        db: &String,
+        db: &str,
         time_range: &TimeRange,
         field_id: FieldId,
     ) -> Vec<DataBlock> {
@@ -344,7 +344,7 @@ impl TsKv {
     // }
 
     // Compact TSM files in database into bigger TSM files.
-    pub async fn compact(&self, database: &String) {
+    pub async fn compact(&self, database: &str) {
         if let Some(db) = self.version_set.read().get_db(database) {
             // TODO: stop current and prevent next flush and compaction.
 
@@ -387,7 +387,7 @@ impl Engine for TsKv {
         let write_group = db.read().build_write_group(fb_points.points().unwrap())?;
 
         let mut seq = 0;
-        if self.options.wal.enabled == true {
+        if self.options.wal.enabled {
             let (cb, rx) = oneshot::channel();
             self.wal_sender
                 .send(WalTask::Write { cb, points })
@@ -457,7 +457,7 @@ impl Engine for TsKv {
 
     fn read(
         &self,
-        db: &String,
+        db: &str,
         sids: Vec<SeriesId>,
         time_range: &TimeRange,
         fields: Vec<u32>,
@@ -465,7 +465,7 @@ impl Engine for TsKv {
         // get data block
         let mut ans = HashMap::new();
         for sid in sids {
-            let sid_entry = ans.entry(sid).or_insert(HashMap::new());
+            let sid_entry = ans.entry(sid).or_insert_with(HashMap::new);
             for field_id in fields.iter() {
                 let field_id_entry = sid_entry.entry(*field_id).or_insert(vec![]);
                 let fid = unite_id((*field_id).into(), sid);
@@ -476,7 +476,7 @@ impl Engine for TsKv {
         // sort data block, max block size 1000
         let mut final_ans = HashMap::new();
         for i in ans {
-            let sid_entry = final_ans.entry(i.0).or_insert(HashMap::new());
+            let sid_entry = final_ans.entry(i.0).or_insert_with(HashMap::new);
             for j in i.1 {
                 let field_id_entry = sid_entry.entry(j.0).or_insert(vec![]);
                 field_id_entry.append(&mut DataBlock::merge_blocks(j.1, MAX_BLOCK_VALUES));
@@ -539,7 +539,7 @@ impl Engine for TsKv {
 
     fn delete_series(
         &self,
-        database: &String,
+        database: &str,
         series_ids: &[SeriesId],
         field_ids: &[FieldId],
         time_range: &TimeRange,
@@ -569,7 +569,7 @@ impl Engine for TsKv {
         Ok(())
     }
 
-    fn get_table_schema(&self, name: &String, tab: &String) -> Result<Option<Vec<FieldInfo>>> {
+    fn get_table_schema(&self, name: &str, tab: &str) -> Result<Option<Vec<FieldInfo>>> {
         if let Some(db) = self.version_set.read().get_db(name) {
             let val = db
                 .read()
@@ -583,9 +583,9 @@ impl Engine for TsKv {
 
     async fn get_series_id_list(
         &self,
-        name: &String,
-        tab: &String,
-        tags: &Vec<Tag>,
+        name: &str,
+        tab: &str,
+        tags: &[Tag],
     ) -> IndexResult<Vec<u64>> {
         if let Some(db) = self.version_set.read().get_db(name) {
             return db
@@ -599,7 +599,7 @@ impl Engine for TsKv {
         Ok(vec![])
     }
 
-    fn get_series_key(&self, name: &String, sid: u64) -> IndexResult<Option<SeriesKey>> {
+    fn get_series_key(&self, name: &str, sid: u64) -> IndexResult<Option<SeriesKey>> {
         if let Some(db) = self.version_set.read().get_db(name) {
             return db.read().get_series_key(sid);
         }
@@ -629,10 +629,10 @@ mod test {
         let tskv = TsKv::open(opt, Arc::new(Runtime::new().unwrap()))
             .await
             .unwrap();
-        tskv.compact(&"public".to_string()).await;
+        tskv.compact("public").await;
     }
 
-    async fn prepare(tskv: &TsKv, database: &String, table: &String, time_range: &TimeRange) {
+    async fn prepare(tskv: &TsKv, database: &str, table: &str, time_range: &TimeRange) {
         let mut fbb = FlatBufferBuilder::new();
         let points = models_helper::create_random_points_with_delta(&mut fbb, 10);
         fbb.finish(points, None);
@@ -646,10 +646,7 @@ mod test {
 
         {
             let table_schema = tskv.get_table_schema(database, table).unwrap().unwrap();
-            let series_ids = tskv
-                .get_series_id_list(database, table, &vec![])
-                .await
-                .unwrap();
+            let series_ids = tskv.get_series_id_list(database, table, &[]).await.unwrap();
 
             let field_ids: Vec<u32> = table_schema.iter().map(|f| f.field_id() as u32).collect();
             let result: HashMap<SeriesId, HashMap<u32, Vec<DataBlock>>> =
@@ -679,38 +676,32 @@ mod test {
             let opt = Options::from(&config);
             let tskv = TsKv::open(opt, runtime).await.unwrap();
 
-            let database = "db".to_string();
-            let table = "table".to_string();
+            let database = "db";
+            let table = "table";
             let time_range = TimeRange::new(i64::MIN, i64::MAX);
 
-            prepare(&tskv, &database, &table, &time_range).await;
+            prepare(&tskv, database, table, &time_range).await;
 
-            tskv.drop_table(&database, &table).unwrap();
+            tskv.drop_table(database, table).unwrap();
 
             {
-                let table_schema = tskv.get_table_schema(&database, &table).unwrap();
+                let table_schema = tskv.get_table_schema(database, table).unwrap();
                 assert!(table_schema.is_none());
 
-                let series_ids = tskv
-                    .get_series_id_list(&database, &table, &vec![])
-                    .await
-                    .unwrap();
+                let series_ids = tskv.get_series_id_list(database, table, &[]).await.unwrap();
                 assert!(series_ids.is_empty());
             }
 
-            tskv.drop_database(&database).unwrap();
+            tskv.drop_database(database).unwrap();
 
             {
-                let db = tskv.version_set.read().get_db(&database);
+                let db = tskv.version_set.read().get_db(database);
                 assert!(db.is_none());
 
-                let table_schema = tskv.get_table_schema(&database, &table).unwrap();
+                let table_schema = tskv.get_table_schema(database, table).unwrap();
                 assert!(table_schema.is_none());
 
-                let series_ids = tskv
-                    .get_series_id_list(&database, &table, &vec![])
-                    .await
-                    .unwrap();
+                let series_ids = tskv.get_series_id_list(database, table, &[]).await.unwrap();
                 assert!(series_ids.is_empty());
             }
         });

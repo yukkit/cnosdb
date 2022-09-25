@@ -175,11 +175,9 @@ impl SeriesData {
             }
 
             for row in group.rows.iter() {
-                if let Some(field) = row.fields.get(index) {
-                    if let Some(field) = field {
-                        entry.field_type = field.value_type();
-                        entry.cells.push(field.data_value(row.ts));
-                    }
+                if let Some(Some(field)) = row.fields.get(index) {
+                    entry.field_type = field.value_type();
+                    entry.cells.push(field.data_value(row.ts));
                 }
             }
         }

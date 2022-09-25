@@ -381,7 +381,7 @@ impl Version {
                 ve.del_files.into_iter().for_each(|f| {
                     deleted_files
                         .entry(f.level)
-                        .or_insert(HashSet::new())
+                        .or_insert_with(HashSet::new)
                         .insert(f.file_id);
                 });
             }
