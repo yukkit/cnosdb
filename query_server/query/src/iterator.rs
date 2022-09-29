@@ -607,6 +607,8 @@ impl Iterator for RowIterator {
             cols.push(item.finish())
         }
 
+        debug!("record-------- {:?}", cols);
+
         match RecordBatch::try_new(self.option.datafusion_schema.clone(), cols) {
             Ok(batch) => Some(Ok(batch)),
             Err(err) => Some(Err(Error::DataFusionNew {
