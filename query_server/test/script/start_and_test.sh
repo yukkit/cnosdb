@@ -27,7 +27,8 @@ function init() {
 }
 
 function test() {
-    cargo run --package test
+    cargo run --package test && \
+    cargo test --package e2e_tests --features=http_api_tests
 }
 
 echo "Starting cnosdb"
