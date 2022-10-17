@@ -3,14 +3,13 @@ use async_trait::async_trait;
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use datafusion::sql::TableReference;
 use models::codec::codec_name_to_codec;
-use models::schema::{ColumnType, TableFiled, TableSchema, TIME_FIELD};
-use models::{SchemaFieldId, ValueType};
+use models::schema::{ColumnType, TableColumn, TableSchema, TIME_FIELD};
+use models::{ColumnId, ValueType};
 use snafu::ResultExt;
 use spi::catalog::{MetaDataRef, MetadataError};
 use spi::query::execution;
 use spi::query::execution::{ExecutionError, Output, QueryStateMachineRef};
 use spi::query::logical_planner::CreateTable;
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub struct CreateTableTask {
@@ -72,11 +71,11 @@ fn build_schema(stmt: &CreateTable, catalog: MetaDataRef) -> TableSchema {
     let CreateTable {
         schema, name, tags, ..
     } = stmt;
-    let mut kv_fields = BTreeMap::new();
+    let mut kv_fields = vec![];
     let mut get_time = false;
     for (i, tag) in tags.iter().enumerate() {
-        let kv_field = TableFiled::new((i + 1) as SchemaFieldId, tag.clone(), ColumnType::Tag, 0);
-        kv_fields.insert(tag.clone(), kv_field);
+        let kv_field = TableColumn::new((i + 1) as ColumnId, tag.to_owned(), ColumnType::Tag, 0);
+        kv_fields.push(kv_field);
     }
 
     let start = kv_fields.len();
@@ -90,8 +89,8 @@ fn build_schema(stmt: &CreateTable, catalog: MetaDataRef) -> TableSchema {
         } else {
             start + i
         };
-        let kv_field = TableFiled::new(
-            id as SchemaFieldId,
+        let kv_field = TableColumn::new(
+            id as ColumnId,
             field_name.clone(),
             data_type_to_column_type(field.data_type()),
             codec_name_to_codec(
@@ -101,7 +100,7 @@ fn build_schema(stmt: &CreateTable, catalog: MetaDataRef) -> TableSchema {
                     .unwrap_or(&"DEFAULT".to_string()),
             ),
         );
-        kv_fields.insert(field_name.clone(), kv_field);
+        kv_fields.push(kv_field);
     }
 
     let table: TableReference = name.as_str().into();

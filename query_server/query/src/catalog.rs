@@ -1,15 +1,11 @@
-use std::{
-    any::Any,
-    collections::{BTreeMap, HashMap},
-    sync::Arc,
-};
+use std::{any::Any, collections::HashMap, sync::Arc};
 
 use datafusion::{
     catalog::{catalog::CatalogProvider, schema::SchemaProvider},
     datasource::TableProvider,
     error::{DataFusionError, Result},
 };
-use models::schema::{DatabaseSchema, TableFiled, TableSchema, TIME_FIELD};
+use models::schema::{DatabaseSchema, TableSchema};
 use parking_lot::RwLock;
 use spi::catalog::TableRef;
 
@@ -134,21 +130,21 @@ impl SchemaProvider for UserSchema {
         // }
 
         let mut tables = self.tables.write();
-        if let Ok(Some(v)) = self.engine.get_table_schema(&self.db_name, name) {
-            let mut fields = BTreeMap::new();
-            let codec = match v.fields.get(TIME_FIELD) {
-                None => 0,
-                Some(v) => v.codec,
-            };
-            // system field (time)
-            let time_field = TableFiled::time_field(codec);
-            fields.insert(time_field.name.clone(), time_field);
+        if let Ok(Some(schema)) = self.engine.get_table_schema(&self.db_name, name) {
+            // let mut fields = BTreeMap::new();
+            // let codec = match v.fields.get(TIME_FIELD) {
+            //     None => 0,
+            //     Some(v) => v.codec,
+            // };
+            // // system field (time)
+            // let time_field = TableFiled::time_field(codec);
+            // fields.insert(time_field.name.clone(), time_field);
 
-            for item in v.fields {
-                let field = item.1;
-                fields.insert(field.name.clone(), field);
-            }
-            let schema = TableSchema::new(self.db_name.clone(), name.to_owned(), fields);
+            // for item in v.fields {
+            //     let field = item.1;
+            //     fields.insert(field.name.clone(), field);
+            // }
+            // let schema = TableSchema::new(self.db_name.clone(), name.to_owned(), fields);
             let table = Arc::new(ClusterTable::new(self.engine.clone(), schema));
             tables.insert(name.to_owned(), table.clone());
             return Some(table);
