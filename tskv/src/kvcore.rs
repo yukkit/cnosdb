@@ -210,7 +210,7 @@ impl TsKv {
                         match send_ret {
                             Ok(wal_result) => {}
                             Err(err) => {
-                                warn!("send WAL write result failed.")
+                                warn!("send WAL write result failed. {:?}", err)
                             }
                         }
                     }

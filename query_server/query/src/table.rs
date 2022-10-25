@@ -16,7 +16,7 @@ use models::{
 use tskv::engine::EngineRef;
 
 use crate::{
-    data_source::tskv_sink::TskvRecordBatchSinkProvider,
+    data_source::parquet_sink::ParquetRecordBatchSinkProvider,
     extension::physical::plan_node::table_writer::TableWriterExec, tskv_exec::TskvExec,
 };
 
@@ -50,10 +50,12 @@ impl ClusterTable {
         _state: &SessionState,
         input: Arc<dyn ExecutionPlan>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let record_batch_sink_privider = Arc::new(TskvRecordBatchSinkProvider::new(
-            self.engine.clone(),
-            self.schema.clone(),
-        ));
+        // let record_batch_sink_privider = Arc::new(TskvRecordBatchSinkProvider::new(
+        //     self.engine.clone(),
+        //     self.schema.clone(),
+        // ));
+
+        let record_batch_sink_privider = Arc::new(ParquetRecordBatchSinkProvider::new());
 
         Ok(Arc::new(TableWriterExec::new(
             input,

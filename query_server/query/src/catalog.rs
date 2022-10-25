@@ -138,19 +138,21 @@ impl SchemaProvider for UserSchema {
     }
 
     fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
-        // table schema may be changed after write, so get from storage engine directly
-        // {
-        //     let tables = self.tables.read();
-        //     if let Some(v) = tables.get(name) {
-        //         return Some(v.clone());
-        //     }
-        // }
+        {
+            let mut tables = self.tables.write();
+            if let Ok(Some(schema)) = self.engine.get_table_schema(&self.db_name, name) {
+                let table = Arc::new(ClusterTable::new(self.engine.clone(), schema));
+                tables.insert(name.to_owned(), table.clone());
+                return Some(table);
+            }
+        }
 
-        let mut tables = self.tables.write();
-        if let Ok(Some(schema)) = self.engine.get_table_schema(&self.db_name, name) {
-            let table = Arc::new(ClusterTable::new(self.engine.clone(), schema));
-            tables.insert(name.to_owned(), table.clone());
-            return Some(table);
+        {
+            let tables = self.tables.read();
+
+            if let Some(v) = tables.get(name) {
+                return Some(v.clone());
+            }
         }
 
         None
