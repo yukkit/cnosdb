@@ -1,11 +1,11 @@
 use arrow_flight::sql::{ActionCreatePreparedStatementResult, ProstAnyExt, SqlInfo};
 use arrow_flight::{
-    flight_service_server, Action, FlightData, FlightEndpoint, HandshakeRequest, HandshakeResponse,
-    IpcMessage, SchemaAsIpc, Ticket,
+    flight_service_server, Action, BasicAuth, FlightData, FlightEndpoint, HandshakeRequest,
+    HandshakeResponse, IpcMessage, SchemaAsIpc, Ticket,
 };
 use chrono::format::Item;
 use datafusion::arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator, IpcWriteOptions};
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use http_protocol::header::{AUTHORIZATION, BASIC_PREFIX};
 use moka::sync::Cache;
 use prost::Message;
@@ -17,8 +17,10 @@ use spi::query::execution::Output;
 use spi::server::dbms::{DBMSRef, DatabaseManagerSystem, DatabaseManagerSystemMock};
 use spi::service::protocol::{Context, ContextBuilder, Query, QueryHandle, QueryId};
 use std::pin::Pin;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
+use tonic::metadata::{AsciiMetadataValue, MetadataValue};
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 use trace::debug;
@@ -78,7 +80,8 @@ impl FlightSqlService for FlightSqlServiceImpl {
         let ori_authorization = request
             .metadata()
             .get(AUTHORIZATION.to_string())
-            .ok_or(Status::invalid_argument("authorization field not present"))?;
+            .ok_or(Status::invalid_argument("authorization field not present"))?
+            .clone();
         let authorization = ori_authorization
             .to_str()
             .map_err(|_| Status::invalid_argument("authorization not parsable"))?;
@@ -89,18 +92,37 @@ impl FlightSqlService for FlightSqlServiceImpl {
             .try_get_basic_auth()
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
+        let requests = request.into_inner();
+        requests
+            .for_each(move |e| async {
+                let req = e.expect("Error reading handshake request");
+                let HandshakeRequest { payload, .. } = req;
+                let auth = BasicAuth::decode(&*payload).expect("Error parsing handshake request");
+
+                debug!("auth: {:?}, {:?}", payload, auth);
+            })
+            .await;
+
         // TODO 校验用户密码
         // if user_info.user != "admin" || user_info.password != "password" {
         //     Err(Status::unauthenticated("Invalid credentials!"))?
         // }
+        let hr = Ok(HandshakeResponse {
+            payload: authorization.as_bytes().to_vec(),
+            ..HandshakeResponse::default()
+        });
 
         let output: Pin<Box<dyn Stream<Item = Result<HandshakeResponse, Status>> + Send>> =
-            Box::pin(futures::stream::iter(vec![]));
+            Box::pin(futures::stream::iter(vec![hr]));
 
         let mut resp = Response::new(output);
 
-        resp.metadata_mut()
-            .insert(AUTHORIZATION.as_str(), ori_authorization.clone());
+        // TODO generate Bearer token
+        let bearer = format!("Bearer {}", authorization);
+        let val = AsciiMetadataValue::try_from(&bearer)
+            .map_err(|e| Status::internal(format!("invalid token: {}", bearer)))?;
+
+        resp.metadata_mut().insert(AUTHORIZATION.as_str(), val);
 
         return Ok(resp);
     }
