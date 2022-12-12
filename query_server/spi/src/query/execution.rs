@@ -208,12 +208,12 @@ pub enum QueryState {
     DONE(DONE),
 }
 
-impl ToString for QueryState {
-    fn to_string(&self) -> String {
+impl AsRef<str> for QueryState {
+    fn as_ref(&self) -> &str {
         match self {
-            QueryState::ACCEPTING => format!("{:?}", self),
-            QueryState::RUNNING(e) => e.to_string(),
-            QueryState::DONE(e) => e.to_string(),
+            QueryState::ACCEPTING => "ACCEPTING",
+            QueryState::RUNNING(e) => e.as_ref(),
+            QueryState::DONE(e) => e.as_ref(),
         }
     }
 }
@@ -226,9 +226,14 @@ pub enum RUNNING {
     SCHEDULING,
 }
 
-impl ToString for RUNNING {
-    fn to_string(&self) -> String {
-        format!("{:?}", self)
+impl AsRef<str> for RUNNING {
+    fn as_ref(&self) -> &str {
+        match self {
+            Self::DISPATCHING => "DISPATCHING",
+            Self::ANALYZING => "ANALYZING",
+            Self::OPTMIZING => "OPTMIZING",
+            Self::SCHEDULING => "SCHEDULING",
+        }
     }
 }
 
@@ -239,8 +244,12 @@ pub enum DONE {
     CANCELLED,
 }
 
-impl ToString for DONE {
-    fn to_string(&self) -> String {
-        format!("{:?}", self)
+impl AsRef<str> for DONE {
+    fn as_ref(&self) -> &str {
+        match self {
+            Self::FINISHED => "FINISHED",
+            Self::FAILED => "FAILED",
+            Self::CANCELLED => "CANCELLED",
+        }
     }
 }

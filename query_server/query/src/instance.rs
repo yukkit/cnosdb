@@ -5,7 +5,11 @@ use coordinator::service::CoordinatorRef;
 use datafusion::scheduler::Scheduler;
 use derive_builder::Builder;
 use models::{
-    auth::user::{User, UserInfo, UserOptionsBuilder, ROOT},
+    auth::{
+        role::{SystemTenantRole, TenantRoleIdentifier},
+        user::{User, UserInfo, UserOptionsBuilder, ROOT},
+    },
+    oid::Identifier,
     schema::TenantOptionsBuilder,
 };
 use spi::{
@@ -181,6 +185,16 @@ fn init_metadata(coord: CoordinatorRef) -> Result<()> {
             match err {
                 MetaError::TenantAlreadyExists { .. } => {}
                 _ => return Err(ServerError::MetaData { source: err }),
+            }
+        }
+
+        debug!("Add root to the system tenant as owner");
+        if let Some(root) = user_manager.user(ROOT).context(MetaDataSnafu)? {
+            if let Some(client) = tenant_manager.tenant_meta(DEFAULT_CATALOG) {
+                let role = TenantRoleIdentifier::System(SystemTenantRole::Owner);
+                client
+                    .add_member_with_role(*root.id(), role)
+                    .context(MetaDataSnafu)?;
             }
         }
 

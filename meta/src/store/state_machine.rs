@@ -338,10 +338,22 @@ impl StateMachine {
             ReadCommand::Members(cluster, tenant_name) => {
                 let path = KeyPath::members(cluster, tenant_name);
 
-                let members: Vec<TenantRoleIdentifier> =
-                    children_data::<TenantRoleIdentifier>(&path, &self.data)
-                        .into_values()
+                let members = children_data::<TenantRoleIdentifier>(&path, &self.data);
+                let users: HashMap<String, UserDesc> =
+                    children_data::<UserDesc>(&KeyPath::users(cluster), &self.data)
+                        .into_iter()
+                        .map(|(_, desc)| (format!("{}", desc.id()), desc))
                         .collect();
+
+                trace::trace!("members of path {}: {:?}", path, members);
+                trace::trace!("all users: {:?}", users);
+
+                let members: HashMap<String, TenantRoleIdentifier> = members
+                    .into_iter()
+                    .filter_map(|(id, role)| users.get(&id).map(|e| (e.name().to_string(), role)))
+                    .collect();
+
+                debug!("returned members of path {}: {:?}", path, members);
 
                 CommonResp::Ok(members).to_string()
             }
