@@ -154,7 +154,7 @@ impl MetaClient for MockMetaClient {
         todo!()
     }
 
-    fn member_role(&self, user_id: &Oid) -> MetaResult<TenantRoleIdentifier> {
+    fn member_role(&self, user_id: &Oid) -> MetaResult<Option<TenantRoleIdentifier>> {
         todo!()
     }
 
