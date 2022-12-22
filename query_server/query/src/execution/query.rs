@@ -6,7 +6,7 @@ use futures::stream::AbortHandle;
 use futures::TryStreamExt;
 use parking_lot::Mutex;
 use snafu::ResultExt;
-use spi::query::dispatcher::{QueryInfo, QueryStatus};
+use spi::query::dispatcher::{QueryInfo, QueryStatus, QueryStatusBuilder};
 use spi::query::execution::{ExecutionError, Output};
 use spi::query::{
     execution::{QueryExecution, QueryStateMachineRef},
@@ -126,9 +126,13 @@ impl QueryExecution for SqlQueryExecution {
     }
 
     fn status(&self) -> QueryStatus {
-        QueryStatus::new(
-            self.query_state_machine.state().clone(),
-            self.query_state_machine.duration(),
-        )
+        unsafe {
+            QueryStatusBuilder::default()
+                .state(self.query_state_machine.state().clone())
+                .duration(self.query_state_machine.duration())
+                .start_time(self.query_state_machine.start_time())
+                .build()
+                .unwrap_unchecked()
+        }
     }
 }

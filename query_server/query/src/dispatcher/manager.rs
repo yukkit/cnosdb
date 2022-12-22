@@ -23,6 +23,7 @@ use spi::{
 
 use spi::query::QueryError::{self, BuildQueryDispatcher};
 use spi::query::{BuildFunctionMetaSnafu, LogicalPlannerSnafu, Result};
+use tokio::runtime::Runtime;
 
 use crate::extension::expr::load_all_functions;
 use crate::function::simple_func_manager::SimpleFunctionMetadataManager;
@@ -31,6 +32,8 @@ use crate::{
     execution::factory::SqlQueryExecutionFactory, sql::logical::planner::DefaultLogicalPlanner,
 };
 
+use super::query_history::manager::QueryHistoryManager;
+use super::query_history::HistoryManagerOptionsBuilder;
 use super::query_tracker::QueryTracker;
 
 #[derive(Clone)]
@@ -40,6 +43,7 @@ pub struct SimpleQueryDispatcher {
     // TODO resource manager
     // query tracker
     query_tracker: Arc<QueryTracker>,
+    query_history_manager: Arc<QueryHistoryManager>,
     // parser
     parser: Arc<dyn Parser + Send + Sync>,
     // get query execution factory
@@ -160,6 +164,7 @@ impl SimpleQueryDispatcher {
 
 #[derive(Default, Clone)]
 pub struct SimpleQueryDispatcherBuilder {
+    history_runtime: Option<Arc<Runtime>>,
     coord: Option<CoordinatorRef>,
     session_factory: Option<Arc<IsiphoSessionCtxFactory>>,
     parser: Option<Arc<dyn Parser + Send + Sync>>,
@@ -172,6 +177,11 @@ pub struct SimpleQueryDispatcherBuilder {
 }
 
 impl SimpleQueryDispatcherBuilder {
+    pub fn with_history_runtime(mut self, history_runtime: Arc<Runtime>) -> Self {
+        self.history_runtime = Some(history_runtime);
+        self
+    }
+
     pub fn with_coord(mut self, coord: CoordinatorRef) -> Self {
         self.coord = Some(coord);
         self
@@ -203,9 +213,14 @@ impl SimpleQueryDispatcherBuilder {
     }
 
     pub fn build(self) -> Result<SimpleQueryDispatcher> {
+        let history_runtime = self.history_runtime.ok_or_else(|| BuildQueryDispatcher {
+            err: "lost of history runtime".to_string(),
+        })?;
+
         let coord = self.coord.ok_or_else(|| BuildQueryDispatcher {
             err: "lost of coord".to_string(),
         })?;
+
         let session_factory = self.session_factory.ok_or_else(|| BuildQueryDispatcher {
             err: "lost of session_factory".to_string(),
         })?;
@@ -222,7 +237,16 @@ impl SimpleQueryDispatcherBuilder {
             err: "lost of scheduler".to_string(),
         })?;
 
-        let query_tracker = Arc::new(QueryTracker::new(self.queries_limit));
+        let options = HistoryManagerOptionsBuilder::default()
+            .build()
+            .map_err(|e| BuildQueryDispatcher { err: e.to_string() })?;
+        let query_history_manager = Arc::new(QueryHistoryManager::new(
+            options,
+            history_runtime,
+            coord.clone(),
+        ));
+        let sender = query_history_manager.start();
+        let query_tracker = Arc::new(QueryTracker::new(self.queries_limit, sender));
 
         let query_execution_factory = Arc::new(SqlQueryExecutionFactory::new(
             optimizer,
@@ -236,6 +260,62 @@ impl SimpleQueryDispatcherBuilder {
             parser,
             query_execution_factory,
             query_tracker,
+            query_history_manager,
         })
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::{sync::Arc, time::Duration};
+
+    use coordinator::service::MockCoordinator;
+    use spi::query::execution::QueryExecution;
+
+    use crate::{
+        dispatcher::{
+            query_history::{manager::QueryHistoryManager, HistoryManagerOptionsBuilder},
+            query_tracker::QueryTracker,
+        },
+        execution::QueryExecutionMock,
+    };
+
+    #[test]
+    fn test() {
+        trace::init_default_global_tracing("/tmp", "test_rust.log", "debug");
+
+        let coord = Arc::new(MockCoordinator {});
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .worker_threads(4)
+                .build()
+                .unwrap(),
+        );
+        let options = HistoryManagerOptionsBuilder::default()
+            .flush_interval(Duration::from_secs(7))
+            .build()
+            .unwrap();
+
+        let query_history_manager = Arc::new(QueryHistoryManager::new(
+            options,
+            runtime.clone(),
+            coord.clone(),
+        ));
+
+        let sender = query_history_manager.start();
+
+        let query_tracker = Arc::new(QueryTracker::new(1_000_000, sender));
+        let execution = Arc::new(QueryExecutionMock {});
+        let info = execution.info();
+
+        for _ in (0..1_000_000).into_iter() {
+            let tracked_query = query_tracker
+                .try_track_query(info.query_id(), execution.clone())
+                .unwrap();
+            drop(tracked_query);
+            // tokio::time::sleep(Duration::from_secs(3)).await;
+            std::thread::sleep(Duration::from_secs(3));
+        }
     }
 }

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use datafusion::{
     arrow::{
-        array::{Float64Builder, StringBuilder},
+        array::{Int64Builder, StringBuilder},
         datatypes::{DataType, Field, Schema, SchemaRef},
         record_batch::RecordBatch,
     },
@@ -21,7 +21,7 @@ lazy_static! {
         Field::new("tenant_id", DataType::Utf8, false),
         Field::new("tenant_name", DataType::Utf8, false),
         Field::new("state", DataType::Utf8, false),
-        Field::new("duration", DataType::Float64, false),
+        Field::new("duration", DataType::Int64, false),
     ]));
 }
 
@@ -34,7 +34,7 @@ pub struct InformationSchemaQueriesBuilder {
     tenant_ids: StringBuilder,
     tenant_names: StringBuilder,
     states: StringBuilder,
-    durations: Float64Builder,
+    durations: Int64Builder,
 }
 
 impl Default for InformationSchemaQueriesBuilder {
@@ -47,7 +47,7 @@ impl Default for InformationSchemaQueriesBuilder {
             tenant_ids: StringBuilder::new(),
             tenant_names: StringBuilder::new(),
             states: StringBuilder::new(),
-            durations: Float64Builder::new(),
+            durations: Int64Builder::new(),
         }
     }
 }
@@ -63,7 +63,7 @@ impl InformationSchemaQueriesBuilder {
         tenant_id: impl AsRef<str>,
         tenant_name: impl AsRef<str>,
         state: impl AsRef<str>,
-        duration: f64,
+        duration: i64,
     ) {
         // Note: append_value is actually infallable.
         self.query_ids.append_value(query_id.as_ref());

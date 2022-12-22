@@ -1,8 +1,8 @@
-use std::time::Duration;
-
 use crate::query::execution::Output;
 use crate::service::protocol::{Query, QueryId};
 use async_trait::async_trait;
+use chrono::Duration;
+use derive_builder::Builder;
 use models::auth::user::UserDesc;
 use models::oid::{Identifier, Oid};
 
@@ -80,22 +80,26 @@ impl QueryInfo {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Builder)]
+#[builder(setter(into, strip_option))]
 pub struct QueryStatus {
     state: QueryState,
     duration: Duration,
+    // ms
+    start_time: i64,
 }
 
 impl QueryStatus {
-    pub fn new(state: QueryState, duration: Duration) -> Self {
-        Self { state, duration }
-    }
-
     pub fn query_state(&self) -> &QueryState {
         &self.state
     }
 
     pub fn duration(&self) -> &Duration {
         &self.duration
+    }
+
+    /// ms
+    pub fn start_time(&self) -> i64 {
+        self.start_time
     }
 }

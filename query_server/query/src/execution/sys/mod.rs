@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use snafu::ResultExt;
+use spi::query::dispatcher::QueryStatusBuilder;
 use spi::query::{self, Result};
 use spi::query::{
     dispatcher::{QueryInfo, QueryStatus},
@@ -74,10 +75,14 @@ impl QueryExecution for SystemExecution {
     }
     // 运行时信息
     fn status(&self) -> QueryStatus {
-        QueryStatus::new(
-            self.state_machine.state().clone(),
-            self.state_machine.duration(),
-        )
+        unsafe {
+            QueryStatusBuilder::default()
+                .state(self.state_machine.state().clone())
+                .duration(self.state_machine.duration())
+                .start_time(self.state_machine.start_time())
+                .build()
+                .unwrap_unchecked()
+        }
     }
 }
 

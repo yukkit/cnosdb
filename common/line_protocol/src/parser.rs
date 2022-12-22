@@ -97,7 +97,7 @@ pub enum FieldValue {
 
 #[derive(Debug, PartialEq)]
 pub struct Line<'a> {
-    hash_id: u64,
+    pub hash_id: u64,
     pub measurement: &'a str,
     pub tags: Vec<(&'a str, &'a str)>,
     pub fields: Vec<(&'a str, FieldValue)>,

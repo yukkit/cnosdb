@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use chrono::Duration;
 use datafusion::arrow::{
-    array::{StringBuilder, UInt64Builder},
+    array::{Int64Builder, StringBuilder},
     datatypes::{DataType, Field, Schema, SchemaRef},
     error::ArrowError,
     record_batch::RecordBatch,
@@ -12,7 +13,6 @@ use spi::{
     query::execution::{ArrowSnafu, ExecutionError, Output, QueryState, QueryStateMachineRef},
     service::protocol::QueryId,
 };
-use std::time::Duration;
 
 use crate::dispatcher::query_tracker::QueryTracker;
 
@@ -62,7 +62,7 @@ struct ShowQueriesResultBuilder {
     users: StringBuilder,
     queries: StringBuilder,
     states: StringBuilder,
-    durations: UInt64Builder,
+    durations: Int64Builder,
 }
 
 impl ShowQueriesResultBuilder {
@@ -72,7 +72,7 @@ impl ShowQueriesResultBuilder {
             Field::new("user", DataType::Utf8, false),
             Field::new("query", DataType::Utf8, false),
             Field::new("state", DataType::Utf8, false),
-            Field::new("duration", DataType::UInt64, false),
+            Field::new("duration", DataType::Int64, false),
         ]));
 
         Self {
@@ -81,7 +81,7 @@ impl ShowQueriesResultBuilder {
             users: StringBuilder::new(),
             queries: StringBuilder::new(),
             states: StringBuilder::new(),
-            durations: UInt64Builder::new(),
+            durations: Int64Builder::new(),
         }
     }
 
@@ -98,7 +98,7 @@ impl ShowQueriesResultBuilder {
         self.users.append_value(user.as_ref());
         self.queries.append_value(query.as_ref());
         self.states.append_value(state.as_ref());
-        self.durations.append_value(duration.as_millis() as u64);
+        self.durations.append_value(duration.num_milliseconds());
     }
 
     fn schema(&self) -> SchemaRef {

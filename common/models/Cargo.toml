@@ -9,6 +9,7 @@ edition = "2021"
 protos = { path = "../protos" }
 utils = { path = "../utils" }
 trace = { path = "../trace" }
+line_protocol = { path = "../line_protocol" }
 
 arrow-schema = { workspace = true,  features = ["serde"] }
 async-trait = { workspace = true }
@@ -22,7 +23,7 @@ datafusion-proto = { workspace = true }
 uuid = { workspace = true }
 derive_builder = { workspace = true }
 openssl = { workspace = true }
+flatbuffers = { workspace = true }
 
 [dev-dependencies]
 chrono = { workspace = true }
-flatbuffers = { workspace = true }

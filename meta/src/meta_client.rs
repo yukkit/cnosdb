@@ -400,8 +400,8 @@ impl RemoteMetaClient {
 
         let _ = client.sync_all_tenant_metadata();
 
-        let client_local = client.clone();
-        let hand = std::thread::spawn(|| RemoteMetaClient::watch_data(client_local));
+        // let client_local = client.clone();
+        // let hand = std::thread::spawn(|| RemoteMetaClient::watch_data(client_local));
 
         client
     }
@@ -934,7 +934,7 @@ impl MetaClient for RemoteMetaClient {
         }
 
         Err(MetaError::CommonError {
-            msg: "create bucket unknown error".to_string(),
+            msg: format!("create bucket unknown error, database min ts: {:?}", self.data.read().database_min_ts(db)),
         })
     }
 

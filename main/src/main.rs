@@ -1,13 +1,14 @@
 #![allow(dead_code, unused_imports, unused_variables)]
 
 use clap::{Parser, Subcommand};
+use config::QueryConfig;
 use coordinator::hh_queue::HintedOffManager;
 use coordinator::service::CoordService;
 use coordinator::writer::PointWriter;
 use meta::meta_client::{MetaClientRef, MetaRef, RemoteMetaManager};
 use models::meta_data::NodeInfo;
 use once_cell::sync::Lazy;
-use query::instance::make_cnosdbms;
+use query::instance::{make_cnosdbms, QueryEngineRuntimes};
 use std::{net::SocketAddr, sync::Arc};
 use tokio::runtime::Runtime;
 use trace::{info, init_global_tracing};
@@ -134,6 +135,9 @@ fn main() -> Result<(), std::io::Error> {
         &global_config.log.level,
     );
 
+    let query_engine_runtimes = build_query_engine_runtimes(&global_config.query)
+        .expect("Failed build query engine runtimes");
+
     // let grpc_host = cli
     //     .grpc_host
     //     .parse::<SocketAddr>()
@@ -193,8 +197,13 @@ fn main() -> Result<(), std::io::Error> {
                 );
 
                 let dbms = Arc::new(
-                    make_cnosdbms(kv_inst.clone(), coord_service.clone(), query_options)
-                        .expect("make dbms"),
+                    make_cnosdbms(
+                        kv_inst.clone(),
+                        coord_service.clone(),
+                        query_options,
+                        query_engine_runtimes,
+                    )
+                    .expect("make dbms"),
                 );
 
                 let tcp_service = Box::new(TcpService::new(
@@ -266,4 +275,22 @@ fn init_runtime(cores: Option<usize>) -> Result<Runtime, std::io::Error> {
                 .build(),
         },
     }
+}
+
+fn build_query_engine_runtimes(
+    _config: &QueryConfig,
+) -> Result<QueryEngineRuntimes, std::io::Error> {
+    use tokio::runtime::Builder;
+
+    // history_runtime only need 2 thread
+    // 1. loop receive history entries
+    // 2. periodic or triggered writes
+    let history_runtime = Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()?;
+
+    Ok(QueryEngineRuntimes {
+        history_runtime: Arc::new(history_runtime),
+    })
 }

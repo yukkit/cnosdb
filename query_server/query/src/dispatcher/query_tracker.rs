@@ -8,18 +8,24 @@ use spi::{
 use tokio::sync::{Semaphore, SemaphorePermit, TryAcquireError};
 use trace::{debug, warn};
 
+use crate::dispatcher::query_history::sender::HistorySender;
+
+use super::query_history::{sender::HistorySenderRef, QueryHistoryEntry, QueryHistoryEntryBuilder};
+
 pub struct QueryTracker {
     queries: RwLock<HashMap<QueryId, Arc<dyn QueryExecution>>>,
     query_limit_semaphore: Semaphore,
+    history_sender: HistorySenderRef,
 }
 
 impl QueryTracker {
-    pub fn new(query_limit: usize) -> Self {
+    pub fn new(query_limit: usize, history_sender: HistorySenderRef) -> Self {
         let query_limit_semaphore = Semaphore::new(query_limit);
 
         Self {
             queries: RwLock::new(HashMap::new()),
             query_limit_semaphore,
+            history_sender,
         }
     }
 }
@@ -86,6 +92,10 @@ impl QueryTracker {
     fn expire_query(&self, id: &QueryId) {
         self.queries.write().remove(id);
     }
+
+    fn send_history(&self, entry: QueryHistoryEntry) {
+        self.history_sender.send_history(entry);
+    }
 }
 
 pub struct TrackedQuery<'a> {
@@ -93,6 +103,57 @@ pub struct TrackedQuery<'a> {
     tracker: &'a QueryTracker,
     query_id: QueryId,
     query: Arc<dyn QueryExecution>,
+}
+
+impl TrackedQuery<'_> {
+    fn construct_and_send_history(&self) {
+        let query_info = self.query.info();
+        let query_status = self.query.status();
+
+        let query_id = self.query_id.to_string();
+        let query_text = query_info.query();
+        let user_name = query_info.user_name();
+        let tenant_name = query_info.tenant_name();
+        let execution_status = query_status.query_state().as_ref();
+        // TODO
+        let error_message = "";
+        let total_elapsed_time = query_status.duration().num_milliseconds();
+        let start_time = query_status.start_time() * 1000 * 1000;
+        let end_time = start_time + total_elapsed_time * 1000 * 1000;
+        // TODO
+        // let bytes_scanned_from_storage ;
+        // let bytes_written_to_storage;
+        // let bytes_read_from_result;
+        // let rows_inserted;
+        // let rows_selected;
+
+        let entry = QueryHistoryEntryBuilder::default()
+            .query_id(query_id)
+            .query_text(query_text)
+            .user_name(user_name)
+            .tenant_name(tenant_name)
+            .execution_status(execution_status)
+            .error_message(error_message)
+            .start_time(start_time)
+            .end_time(end_time)
+            .total_elapsed_time(total_elapsed_time)
+            // .bytes_scanned_from_storage(bytes_scanned_from_storage)
+            // .bytes_written_to_storage(bytes_written_to_storage)
+            // .bytes_read_from_result(bytes_read_from_result)
+            // .rows_inserted(rows_inserted)
+            // .rows_selected(rows_selected)
+            .build();
+
+        match entry {
+            Ok(e) => {
+                trace::debug!("send query history entry: {:?}", e);
+                self.tracker.send_history(e)
+            }
+            Err(err) => {
+                trace::error!("construct {:?} history entry error: {}", self.query_id, err);
+            }
+        }
+    }
 }
 
 impl Deref for TrackedQuery<'_> {
@@ -107,6 +168,7 @@ impl Drop for TrackedQuery<'_> {
     fn drop(&mut self) {
         debug!("TrackedQuery drop: {:?}", &self.query_id);
         self.tracker.expire_query(&self.query_id);
+        self.construct_and_send_history();
     }
 }
 
@@ -114,51 +176,25 @@ impl Drop for TrackedQuery<'_> {
 mod tests {
     use std::sync::Arc;
 
-    use async_trait::async_trait;
-    use models::auth::user::{UserDesc, UserOptions};
-    use spi::{
-        query::{
-            dispatcher::{QueryInfo, QueryStatus},
-            execution::{Output, QueryExecution, QueryState, RUNNING},
-            QueryError,
-        },
-        service::protocol::QueryId,
-    };
-    use std::time::Duration;
+    use spi::{query::execution::QueryExecution, service::protocol::QueryId};
+
+    use crate::{dispatcher::query_history::sender::HistorySender, execution::QueryExecutionMock};
 
     use super::QueryTracker;
 
-    struct QueryExecutionMock {}
+    struct HistorySenderMock;
 
-    #[async_trait]
-    impl QueryExecution for QueryExecutionMock {
-        async fn start(&self) -> std::result::Result<Output, QueryError> {
-            Ok(Output::Nil(()))
-        }
-        fn cancel(&self) -> std::result::Result<(), QueryError> {
-            Ok(())
-        }
-        fn info(&self) -> QueryInfo {
-            let options = UserOptions::default();
-            let desc = UserDesc::new(0_u128, "user".to_string(), options, true);
-            QueryInfo::new(
-                1_u64.into(),
-                "test".to_string(),
-                0_u128,
-                "tenant".to_string(),
-                desc,
-            )
-        }
-        fn status(&self) -> QueryStatus {
-            QueryStatus::new(
-                QueryState::RUNNING(RUNNING::SCHEDULING),
-                Duration::new(0, 1),
-            )
+    impl HistorySender for HistorySenderMock {
+        fn send_history(&self, _entry: crate::dispatcher::query_history::QueryHistoryEntry) {}
+
+        fn is_closed(&self) -> bool {
+            false
         }
     }
 
     fn new_query_tracker(limit: usize) -> QueryTracker {
-        QueryTracker::new(limit)
+        todo!()
+        // QueryTracker::new(limit, Arc::new(HistorySenderMock))
     }
 
     #[test]

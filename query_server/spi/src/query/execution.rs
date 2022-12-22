@@ -1,14 +1,15 @@
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use chrono::{DateTime, Duration, Utc};
 use coordinator::service::CoordinatorRef;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::arrow::error::ArrowError;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::error::DataFusionError;
 use meta::error::MetaError;
+use parking_lot::RwLock;
 use snafu::Snafu;
 
 use crate::service::protocol::Query;
@@ -123,8 +124,10 @@ pub struct QueryStateMachine {
     pub meta: MetaRef,
     pub coord: CoordinatorRef,
 
+    start_time: DateTime<Utc>,
+    end_time: RwLock<Option<DateTime<Utc>>>,
+
     state: AtomicPtr<QueryState>,
-    start: Instant,
 }
 
 impl QueryStateMachine {
@@ -142,8 +145,9 @@ impl QueryStateMachine {
             query,
             meta,
             coord,
+            start_time: Utc::now(),
+            end_time: Default::default(),
             state: AtomicPtr::new(Box::into_raw(Box::new(QueryState::ACCEPTING))),
-            start: Instant::now(),
         }
     }
 
@@ -175,30 +179,38 @@ impl QueryStateMachine {
     }
 
     pub fn finish(&self) {
-        // TODO
-        self.translate_to(Box::new(QueryState::DONE(DONE::FINISHED)));
+        self.translate_to_done(DONE::FINISHED);
     }
 
     pub fn cancel(&self) {
-        // TODO
-        self.translate_to(Box::new(QueryState::DONE(DONE::CANCELLED)));
+        self.translate_to_done(DONE::CANCELLED);
     }
 
     pub fn fail(&self) {
-        // TODO
-        self.translate_to(Box::new(QueryState::DONE(DONE::FAILED)));
+        self.translate_to_done(DONE::FAILED);
     }
 
     pub fn state(&self) -> &QueryState {
         unsafe { &*self.state.load(Ordering::Relaxed) }
     }
 
+    /// ms
+    pub fn start_time(&self) -> i64 {
+        self.start_time.timestamp_millis()
+    }
+
     pub fn duration(&self) -> Duration {
-        self.start.elapsed()
+        self.end_time.read().unwrap_or(Utc::now()) - self.start_time
     }
 
     fn translate_to(&self, state: Box<QueryState>) {
         self.state.store(Box::into_raw(state), Ordering::Relaxed);
+    }
+
+    fn translate_to_done(&self, state: DONE) {
+        self.translate_to(Box::new(QueryState::DONE(state)));
+        // record end time
+        let _ = self.end_time.write().replace(Utc::now());
     }
 }
 

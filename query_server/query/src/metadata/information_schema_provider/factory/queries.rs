@@ -61,7 +61,7 @@ impl InformationSchemaTableFactory for QueriesFactory {
             let tenant_name = info.tenant_name();
 
             let state = status.query_state();
-            let duration = status.duration().as_secs_f64();
+            let duration = status.duration().num_milliseconds();
 
             builder.append_row(
                 query_id,
