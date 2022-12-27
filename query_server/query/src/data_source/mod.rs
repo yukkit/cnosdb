@@ -4,6 +4,7 @@ use snafu::Snafu;
 
 use crate::utils::point_util::PointUtilError;
 
+pub mod object_store;
 pub mod sink;
 pub mod tskv_sink;
 

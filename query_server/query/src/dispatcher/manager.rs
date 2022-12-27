@@ -143,6 +143,7 @@ impl SimpleQueryDispatcher {
         query_state_machine.begin_analyze();
         let logical_plan = logical_planner
             .create_logical_plan(stmt.clone(), &query_state_machine.session)
+            .await
             .context(LogicalPlannerSnafu)?;
         query_state_machine.end_analyze();
 

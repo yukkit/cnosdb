@@ -1,9 +1,9 @@
 use std::fmt;
 
-use datafusion::sql::sqlparser::ast::SqlOption;
 use datafusion::sql::sqlparser::ast::{
     AnalyzeFormat, DataType, Expr, Ident, ObjectName, Offset, OrderByExpr, Value,
 };
+use datafusion::sql::sqlparser::ast::{SqlOption, TableFactor};
 use datafusion::sql::{parser::CreateExternalTable, sqlparser::ast::Statement};
 use models::codec::Encoding;
 
@@ -14,6 +14,9 @@ use super::logical_planner::{DatabaseObjectType, GlobalObjectType, TenantObjectT
 pub enum ExtStatement {
     /// ANSI SQL AST node
     SqlStatement(Box<Statement>),
+
+    // bulk load/unload
+    Copy(Copy),
 
     CreateExternalTable(CreateExternalTable),
     CreateTable(CreateTable),
@@ -43,6 +46,38 @@ pub enum ExtStatement {
     AlterTable(AlterTable),
     AlterTenant(AlterTenant),
     AlterUser(AlterUser),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Copy {
+    pub copy_target: CopyTarget,
+    pub file_format_options: Vec<SqlOption>,
+    pub copy_options: Vec<SqlOption>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CopyTarget {
+    IntoTable(CopyIntoTable),
+    IntoLocation(CopyIntoLocation),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyIntoTable {
+    pub location: UriLocation,
+    pub table_name: ObjectName,
+    pub columns: Vec<Ident>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyIntoLocation {
+    pub from: TableFactor,
+    pub location: UriLocation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UriLocation {
+    pub path: String,
+    pub connection_options: Vec<SqlOption>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -313,5 +348,13 @@ pub fn parse_string_value(value: Value) -> std::result::Result<String, String> {
     match value {
         Value::SingleQuotedString(s) => Ok(s),
         _ => Err(format!("expected string value, but found : {}", value)),
+    }
+}
+
+pub fn parse_char_value(value: Value) -> std::result::Result<char, String> {
+    let token = parse_string_value(value)?;
+    match token.len() {
+        1 => Ok(token.chars().next().unwrap()),
+        _ => Err("Delimiter must be a single char".to_string()),
     }
 }

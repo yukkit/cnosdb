@@ -8,6 +8,7 @@ use self::{execution::ExecutionError, logical_planner::LogicalPlannerError};
 
 pub mod ast;
 pub mod auth;
+pub mod datasource;
 pub mod dispatcher;
 pub mod execution;
 pub mod function;

@@ -10,7 +10,6 @@ use models::schema::TskvTableSchemaRef;
 use protos::kv_service::WritePointsRpcRequest;
 use snafu::ResultExt;
 use spi::query::DEFAULT_CATALOG;
-use trace::debug;
 
 use crate::utils::point_util::record_batch_to_points_flat_buffer;
 
@@ -32,9 +31,11 @@ pub struct TskvRecordBatchSink {
 #[async_trait]
 impl RecordBatchSink for TskvRecordBatchSink {
     async fn append(&self, record_batch: RecordBatch) -> Result<()> {
-        debug!(
+        trace::trace!(
             "Partition: {}, \nTskvTableSchema: {:?}, \nTskvRecordBatchSink::append: {:?}",
-            self.partition, self.schema, record_batch,
+            self.partition,
+            self.schema,
+            record_batch,
         );
 
         // record batchs to points

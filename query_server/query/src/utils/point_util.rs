@@ -17,8 +17,6 @@ use protos::models::Point;
 use protos::models::{FieldBuilder, FieldType, PointArgs, Points, PointsArgs, TagBuilder};
 use snafu::Snafu;
 
-use trace::debug;
-
 define_result!(PointUtilError);
 
 #[derive(Debug, Snafu)]
@@ -134,7 +132,7 @@ pub fn record_batch_to_points_flat_buffer(
         col: TIME_FIELD_NAME.to_string(),
     })?;
 
-    debug!(
+    trace::trace!(
         "time: {:?}, record num: {}, col num: {}",
         time_col_array,
         record_batch.num_rows(),
