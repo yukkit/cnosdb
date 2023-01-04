@@ -1,13 +1,13 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::scheduler::Scheduler;
 use futures::stream::AbortHandle;
 use futures::TryStreamExt;
 use parking_lot::Mutex;
 use snafu::ResultExt;
 use spi::query::dispatcher::{QueryInfo, QueryStatus};
 use spi::query::execution::{ExecutionError, Output};
+use spi::query::scheduler::SchedulerRef;
 use spi::query::{
     execution::{QueryExecution, QueryStateMachineRef},
     logical_planner::QueryPlan,
@@ -22,7 +22,7 @@ pub struct SqlQueryExecution {
     query_state_machine: QueryStateMachineRef,
     plan: QueryPlan,
     optimizer: Arc<dyn Optimizer + Send + Sync>,
-    scheduler: Arc<Scheduler>,
+    scheduler: SchedulerRef,
 
     abort_handle: Mutex<Option<AbortHandle>>,
 }
@@ -32,7 +32,7 @@ impl SqlQueryExecution {
         query_state_machine: QueryStateMachineRef,
         plan: QueryPlan,
         optimizer: Arc<dyn Optimizer + Send + Sync>,
-        scheduler: Arc<Scheduler>,
+        scheduler: SchedulerRef,
     ) -> Self {
         Self {
             query_state_machine,
