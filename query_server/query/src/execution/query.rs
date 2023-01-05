@@ -64,6 +64,7 @@ impl SqlQueryExecution {
             )
             .context(ScheduleSnafu)?
             .stream();
+        debug!("Success build result stream.");
         let schema_ref = stream.schema();
         let execution_result =
             stream

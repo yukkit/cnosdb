@@ -83,7 +83,7 @@ impl QueryDispatcher for SimpleQueryDispatcher {
             session.clone(),
         );
 
-        let logical_planner = DefaultLogicalPlanner::new(scheme_provider);
+        let logical_planner = DefaultLogicalPlanner::new(&scheme_provider);
 
         let statements = self.parser.parse(query.content())?;
 
@@ -136,7 +136,7 @@ impl SimpleQueryDispatcher {
     async fn execute_statement<S: ContextProviderExtension + Send + Sync>(
         &self,
         stmt: ExtStatement,
-        logical_planner: &DefaultLogicalPlanner<S>,
+        logical_planner: &DefaultLogicalPlanner<'_, S>,
         query_state_machine: Arc<QueryStateMachine>,
     ) -> Result<Output> {
         // begin analyze
