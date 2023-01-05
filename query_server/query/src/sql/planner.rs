@@ -1793,7 +1793,6 @@ fn build_file_extension_and_format(
     file_format_options: FileFormatOptions,
 ) -> datafusion::common::Result<(String, Arc<dyn FileFormat>)> {
     let FileFormatOptions {
-        // TODO auto infer
         file_type,
         delimiter,
         with_header,

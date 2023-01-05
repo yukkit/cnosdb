@@ -62,7 +62,10 @@ pub enum DataSourceError {
     BuildArrowWriter { source: ParquetError },
 
     #[snafu(display("Failed to serialize data to parquet bytes, error: {}", source))]
-    Serialize { source: ParquetError },
+    SerializeParquet { source: ParquetError },
+
+    #[snafu(display("Failed to serialize data to csv bytes, error: {}", source))]
+    SerializeCsv { source: ArrowError },
 }
 
 #[async_trait]

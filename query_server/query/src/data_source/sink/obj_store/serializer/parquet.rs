@@ -13,7 +13,7 @@ use spi::query::datasource::WriteContext;
 
 use crate::data_source::{
     sink::RecordBatchSerializer, BuildArrowWriterSnafu, DataSourceError, FetchBatchSnafu,
-    SerializeSnafu,
+    SerializeParquetSnafu,
 };
 
 pub struct ParquetRecordBatchSerializer {}
@@ -59,7 +59,7 @@ where
         ArrowWriter::try_new(output, Arc::clone(&schema), None).context(BuildArrowWriterSnafu)?;
 
     while let Some(batch) = stream.try_next().await.context(FetchBatchSnafu)? {
-        writer.write(&batch).context(SerializeSnafu)?;
+        writer.write(&batch).context(SerializeParquetSnafu)?;
     }
 
     let file_meta_data = writer
