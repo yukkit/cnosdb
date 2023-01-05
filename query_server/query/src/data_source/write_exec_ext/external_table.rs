@@ -21,7 +21,8 @@ use crate::{
         sink::{
             obj_store::{
                 serializer::{
-                    csv::CsvRecordBatchSerializer, parquet::ParquetRecordBatchSerializer,
+                    csv::CsvRecordBatchSerializer, json::NdJsonRecordBatchSerializer,
+                    parquet::ParquetRecordBatchSerializer,
                 },
                 ObjectStoreSinkProvider,
             },
@@ -92,7 +93,7 @@ fn get_record_batch_serializer(
     } else if any.is::<AvroFormat>() {
         unimplemented!()
     } else if any.is::<JsonFormat>() {
-        unimplemented!()
+        Arc::new(NdJsonRecordBatchSerializer {}) as _
     } else {
         return Err(DataFusionError::NotImplemented(
             "Only support ParquetFormat | CsvFormat | AvroFormat | JsonFormat, this maybe a bug."

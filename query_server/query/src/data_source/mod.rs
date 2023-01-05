@@ -66,6 +66,9 @@ pub enum DataSourceError {
 
     #[snafu(display("Failed to serialize data to csv bytes, error: {}", source))]
     SerializeCsv { source: ArrowError },
+
+    #[snafu(display("Failed to serialize data to json bytes, error: {}", source))]
+    SerializeJson { source: ArrowError },
 }
 
 #[async_trait]
