@@ -1,6 +1,7 @@
 use async_recursion::async_recursion;
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::{DataType, SchemaRef};
+use datafusion::arrow::error::ArrowError;
 use datafusion::datasource::file_format::avro::AvroFormat;
 use datafusion::datasource::file_format::csv::CsvFormat;
 use datafusion::datasource::file_format::file_type::FileType;
@@ -66,12 +67,12 @@ use spi::query::ast::{
 use spi::query::logical_planner::{
     self, parse_connection_options, sql_options_to_tenant_options, sql_options_to_user_options,
     AlterDatabase, AlterTable, AlterTableAction, AlterTenant, AlterTenantAction,
-    AlterTenantAddUser, AlterTenantSetUser, AlterUser, AlterUserAction, CopyOptionsBuilder,
-    CreateDatabase, CreateRole, CreateTable, CreateTenant, CreateUser, DDLPlan, DatabaseObjectType,
-    DescribeDatabase, DescribeTable, DropDatabaseObject, DropGlobalObject, DropTenantObject,
-    ExternalSnafu, FileFormatOptions, FileFormatOptionsBuilder, GlobalObjectType, GrantRevoke,
-    LogicalPlanner, LogicalPlannerError, ObjectStoreSnafu, Plan, PlanWithPrivileges, QueryPlan,
-    SYSPlan, TenantObjectType,
+    AlterTenantAddUser, AlterTenantSetUser, AlterUser, AlterUserAction, ArrowSnafu, CopyOptions,
+    CopyOptionsBuilder, CreateDatabase, CreateRole, CreateTable, CreateTenant, CreateUser, DDLPlan,
+    DatabaseObjectType, DescribeDatabase, DescribeTable, DropDatabaseObject, DropGlobalObject,
+    DropTenantObject, ExternalSnafu, FileFormatOptions, FileFormatOptionsBuilder, GlobalObjectType,
+    GrantRevoke, LogicalPlanner, LogicalPlannerError, ObjectStoreSnafu, Plan, PlanWithPrivileges,
+    QueryPlan, SYSPlan, TenantObjectType,
 };
 use spi::query::session::IsiphoSessionCtx;
 
@@ -1416,7 +1417,7 @@ impl<'a, S: ContextProviderExtension + Send + Sync + 'a> SqlPlaner<'a, S> {
             .map_err(|err| LogicalPlannerError::Semantic { err })?
             .build();
 
-        let _copy_options = CopyOptionsBuilder::default()
+        let copy_options = CopyOptionsBuilder::default()
             .apply_options(copy_options)
             .map_err(|err| LogicalPlannerError::Semantic { err })?
             .build();
@@ -1428,7 +1429,7 @@ impl<'a, S: ContextProviderExtension + Send + Sync + 'a> SqlPlaner<'a, S> {
                 // .   TableWriter
                 //         ListingTable
                 let (external_location_table, target_table, insert_columns) = self
-                    .build_source_and_target_table(session, stmt, file_format_options)
+                    .build_source_and_target_table(session, stmt, file_format_options, copy_options)
                     .await?;
 
                 let plan = build_copy_into_table_plan(
@@ -1472,6 +1473,7 @@ impl<'a, S: ContextProviderExtension + Send + Sync + 'a> SqlPlaner<'a, S> {
         session: &IsiphoSessionCtx,
         stmt: CopyIntoTable,
         file_format_options: FileFormatOptions,
+        copy_options: CopyOptions,
     ) -> Result<(Arc<dyn TableSource>, TableSourceAdapter, Vec<String>)> {
         let CopyIntoTable {
             location,
@@ -1484,8 +1486,10 @@ impl<'a, S: ContextProviderExtension + Send + Sync + 'a> SqlPlaner<'a, S> {
             connection_options,
         } = location;
 
+        let CopyOptions { auto_infer_schema } = copy_options;
+
         let table_path = ListingTableUrl::parse(path).context(ExternalSnafu)?;
-        let insert_columns = columns.iter().map(normalize_ident).collect();
+        let insert_columns = columns.iter().map(normalize_ident).collect::<Vec<_>>();
 
         // 1. Build and register object store
         build_and_register_object_store(
@@ -1502,10 +1506,28 @@ impl<'a, S: ContextProviderExtension + Send + Sync + 'a> SqlPlaner<'a, S> {
             .context(ExternalSnafu)?;
 
         // 3. According to the external path, construct the external table
+        let default_schema = if auto_infer_schema {
+            None
+        } else {
+            let schema = target_table_source.inner().schema();
+            if insert_columns.is_empty() {
+                // Use the schema of the insert table directly
+                Some(schema)
+            } else {
+                // projection with specific columns
+                // e.g. COPY INTO inner_csv_v2(time, tag1, tag2, bigint_c, string_c, ubigint_c, boolean_c, double_c)
+                let indices = insert_columns
+                    .iter()
+                    .map(|e| schema.index_of(e))
+                    .collect::<std::result::Result<Vec<usize>, ArrowError>>()
+                    .context(ArrowSnafu)?;
+                Some(Arc::new(schema.project(&indices).context(ArrowSnafu)?))
+            }
+        };
         let external_location_table_source = build_external_location_table_source(
             &session.inner().state(),
             table_path,
-            None,
+            default_schema,
             file_format_options,
             session.inner().copied_config(),
         )

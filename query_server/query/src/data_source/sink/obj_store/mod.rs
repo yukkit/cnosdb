@@ -44,12 +44,14 @@ impl RecordBatchSink for ObjectStoreSink {
         let (rows_writed, data) = self.s.to_bytes(&self.ctx, stream).await?;
         let bytes_writed = data.len();
 
-        self.object_store
-            .put(&path, data)
-            .await
-            .context(WriteSnafu)?;
+        if bytes_writed > 0 {
+            self.object_store
+                .put(&path, data)
+                .await
+                .context(WriteSnafu)?;
 
-        debug!("Generated parquet file: {}", path);
+            debug!("Generated parquet file: {}", path);
+        }
 
         Ok(SinkMetadata::new(rows_writed, bytes_writed))
     }
