@@ -112,6 +112,7 @@ impl From<&Config> for StorageOptions {
 pub struct QueryOptions {
     pub max_server_connections: u32,
     pub auth_enabled: bool,
+    pub supports_aggregate_pushdown: bool,
 }
 
 impl From<&Config> for QueryOptions {
@@ -119,6 +120,7 @@ impl From<&Config> for QueryOptions {
         Self {
             max_server_connections: config.query.max_server_connections,
             auth_enabled: config.query.auth_enabled,
+            supports_aggregate_pushdown: config.query.auth_enabled,
         }
     }
 }

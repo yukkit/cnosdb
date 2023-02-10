@@ -89,8 +89,8 @@ pub async fn make_cnosdbms(
     coord: CoordinatorRef,
     options: Options,
 ) -> Result<impl DatabaseManagerSystem> {
-    // TODO session config need load global system config
-    let session_factory = Arc::new(IsiphoSessionCtxFactory::default());
+    // session config need load global system config
+    let session_factory = Arc::new(IsiphoSessionCtxFactory::new(options.query.clone()));
     let parser = Arc::new(DefaultParser::default());
     let optimizer = Arc::new(CascadeOptimizerBuilder::default().build());
     // TODO wrap, and num_threads configurable

@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::ops::Deref;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -8,17 +9,23 @@ use datafusion::common::DFSchemaRef;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::SessionState;
-use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
+use datafusion::logical_expr::expr::AggregateFunction;
+use datafusion::logical_expr::logical_plan::AggWithGrouping;
+use datafusion::logical_expr::{
+    aggregate_function, Expr, TableProviderAggregationPushDown, TableProviderFilterPushDown,
+};
 use datafusion::physical_plan::{project_schema, ExecutionPlan};
 use meta::error::MetaError;
-use models::predicate::domain::{Predicate, PredicateRef};
+use models::predicate::domain::{Predicate, PredicateRef, PushedAggregateFunction};
 use models::schema::{TskvTableSchema, TskvTableSchemaRef};
+use trace::debug;
 
 use crate::data_source::sink::tskv::TskvRecordBatchSinkProvider;
 use crate::data_source::WriteExecExt;
+use crate::extension::physical::plan_node::aggregate_filter_scan::AggregateFilterTskvExec;
 use crate::extension::physical::plan_node::table_writer::TableWriterExec;
 use crate::extension::physical::plan_node::tag_scan::TagScanExec;
-use crate::tskv_exec::TskvExec;
+use crate::extension::physical::plan_node::tskv_exec::TskvExec;
 
 #[derive(Clone)]
 pub struct ClusterTable {
@@ -98,6 +105,7 @@ impl TableProvider for ClusterTable {
         _state: &SessionState,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
+        agg_with_grouping: Option<&AggWithGrouping>,
         // limit can be used to reduce the amount scanned
         // from the datasource as a performance optimization.
         // If set, it contains the amount of rows needed by the `LogicalPlan`,
@@ -110,11 +118,131 @@ impl TableProvider for ClusterTable {
                 .push_down_filter(filters, &self.schema),
         );
 
+        if let Some(agg_with_grouping) = agg_with_grouping {
+            debug!("Create aggregate filter tskv scan.");
+            return create_agg_filter_scan(self.coord.clone(), filter, agg_with_grouping);
+        }
+
         return self.create_physical_plan(projection, filter).await;
     }
+
     fn supports_filter_pushdown(&self, _: &Expr) -> Result<TableProviderFilterPushDown> {
         Ok(TableProviderFilterPushDown::Inexact)
     }
+
+    fn supports_aggregate_pushdown(
+        &self,
+        group_expr: &[Expr],
+        aggr_expr: &[Expr],
+    ) -> Result<TableProviderAggregationPushDown> {
+        if !group_expr.is_empty() {
+            return Ok(TableProviderAggregationPushDown::Unsupported);
+        }
+
+        let result = if aggr_expr.iter().all(|e| {
+            match e {
+                Expr::AggregateFunction(AggregateFunction {
+                    fun,
+                    args,
+                    distinct,
+                    filter,
+                }) => {
+                    let support_agg_func = matches!(
+                        fun,
+                        aggregate_function::AggregateFunction::Count // TODO
+                                                                     // | aggregate_function::AggregateFunction::Max
+                                                                     // | aggregate_function::AggregateFunction::Min
+                                                                     // | aggregate_function::AggregateFunction::Sum
+                    );
+
+                    support_agg_func
+                        && args.len() == 1
+                        && matches!(args[0], Expr::Column(_))
+                        && !distinct
+                        && filter.is_none()
+                }
+                _ => false,
+            }
+        }) {
+            TableProviderAggregationPushDown::Ungrouped
+        } else {
+            TableProviderAggregationPushDown::Unsupported
+        };
+
+        Ok(result)
+    }
+}
+
+fn create_agg_filter_scan(
+    coord: CoordinatorRef,
+    filter: Arc<Predicate>,
+    agg_with_grouping: &AggWithGrouping,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    // TODO only extract time range from filter
+
+    let AggWithGrouping {
+        group_expr: _,
+        agg_expr,
+        schema,
+    } = agg_with_grouping;
+
+    let aggs = agg_expr
+        .iter()
+        .map(|e| match e {
+            Expr::AggregateFunction(agg) => Ok(agg),
+            _ => Err(DataFusionError::Plan(
+                "Invalid plan, pushed aggregate functions contains unsupported".to_string(),
+            )),
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let pushed_aggs = aggs
+        .into_iter()
+        .map(|agg| {
+            let AggregateFunction { fun, args, .. } = agg;
+
+            args.iter()
+                .map(|expr| {
+                    // The parameter of the aggregate function pushed down must be a column column
+                    match expr {
+                        Expr::Column(c) => Ok(c),
+                        _ => Err(DataFusionError::Internal(format!(
+                            "Pushed aggregate functions's args contains non-column: {expr:?}."
+                        ))),
+                    }
+                })
+                .collect::<Result<Vec<_>>>()
+                .and_then(|columns| {
+                    // Convert pushdown aggregate functions to intermediate structures
+                    match fun {
+                        aggregate_function::AggregateFunction::Count => {
+                            let column = columns
+                                .first()
+                                .ok_or_else(|| {
+                                    DataFusionError::Internal(
+                                        "Pushed aggregate functions's args is none.".to_string(),
+                                    )
+                                })?
+                                .deref()
+                                .clone();
+                            Ok(PushedAggregateFunction::Count(column.name))
+                        }
+                        // aggregate_function::AggregateFunction::Max => {},
+                        // aggregate_function::AggregateFunction::Min => {},
+                        _ => Err(DataFusionError::Internal(
+                            "Pushed aggregate functions's args is none.".to_string(),
+                        )),
+                    }
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(Arc::new(AggregateFilterTskvExec::new(
+        coord,
+        SchemaRef::from(schema.deref()),
+        pushed_aggs,
+        filter,
+    )))
 }
 
 #[async_trait]

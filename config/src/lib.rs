@@ -98,6 +98,8 @@ pub struct QueryConfig {
     pub write_sql_limit: u64,
     #[serde(default = "QueryConfig::default_auth_enabled")]
     pub auth_enabled: bool,
+    #[serde(default = "QueryConfig::default_supports_aggregate_pushdown")]
+    pub supports_aggregate_pushdown: bool,
 }
 
 impl QueryConfig {
@@ -117,6 +119,10 @@ impl QueryConfig {
         false
     }
 
+    fn default_supports_aggregate_pushdown() -> bool {
+        true
+    }
+
     pub fn override_by_env(&mut self) {
         if let Ok(size) = std::env::var("MAX_SERVER_CONNECTIONS") {
             self.max_server_connections = size.parse::<u32>().unwrap();
@@ -129,6 +135,9 @@ impl QueryConfig {
         }
         if let Ok(val) = std::env::var("AUTH_ENABLED") {
             self.auth_enabled = val.parse::<bool>().unwrap();
+        }
+        if let Ok(val) = std::env::var("SUPPORTS_AGGREGATE_PUSHDOWN") {
+            self.supports_aggregate_pushdown = val.parse::<bool>().unwrap();
         }
     }
 }
@@ -522,6 +531,7 @@ max_server_connections = 10240
 query_sql_limit = 16777216   # 16 * 1024 * 1024
 write_sql_limit = 167772160  # 160 * 1024 * 1024
 auth_enabled = false
+supports_aggregate_pushdown = true
 
 [storage]
 

@@ -85,10 +85,10 @@ use spi::{QueryError, Result};
 use trace::{debug, warn};
 use url::Url;
 
+use crate::data_source::table_provider::tskv::ClusterTable;
 use crate::metadata::{ContextProviderExtension, DatabaseSet, CLUSTER_SCHEMA, INFORMATION_SCHEMA};
 use crate::sql::logical::planner::TableWriteExt;
 use crate::sql::parser::{merge_object_name, normalize_ident, normalize_sql_object_name};
-use crate::table::ClusterTable;
 
 /// CnosDB SQL query planner
 pub struct SqlPlaner<'a, S: ContextProviderExtension> {
@@ -2198,7 +2198,7 @@ mod tests {
         );
         let user = User::new(user_desc, HashSet::default());
         let context = ContextBuilder::new(user).build();
-        IsiphoSessionCtxFactory::default().create_isipho_session_ctx(context, 0_u128)
+        IsiphoSessionCtxFactory::create_test_isipho_session_ctx(context, 0_u128)
     }
 
     #[tokio::test]
