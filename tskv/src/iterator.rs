@@ -176,6 +176,7 @@ pub struct QueryOption {
 }
 
 impl QueryOption {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         batch_size: usize,
         tenant: String,
@@ -890,7 +891,7 @@ impl RowIterator {
                         ValueType::Unknown => todo!(),
                         _ => {
                             let agg_ret = version
-                                .count_by_predicates(item.id, time_ranges.clone())
+                                .count_by_predicates(&self.series, item.id, time_ranges.clone())
                                 .await?;
                             let field_builder = builder[i]
                                 .as_any_mut()

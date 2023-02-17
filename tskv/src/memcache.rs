@@ -202,11 +202,23 @@ pub struct RowGroup {
 
 #[derive(Debug)]
 pub struct SeriesData {
+    pub series_id: SeriesId,
     pub range: TimeRange,
     pub groups: Vec<RowGroup>,
 }
 
 impl SeriesData {
+    fn new(series_id: SeriesId) -> Self {
+        Self {
+            series_id,
+            range: TimeRange {
+                min_ts: i64::MAX,
+                max_ts: i64::MIN,
+            },
+            groups: Vec::with_capacity(4),
+        }
+    }
+
     pub fn write(&mut self, mut group: RowGroup) {
         self.range.merge(&group.range);
 
@@ -306,18 +318,6 @@ impl SeriesData {
     }
 }
 
-impl Default for SeriesData {
-    fn default() -> Self {
-        Self {
-            range: TimeRange {
-                min_ts: i64::MAX,
-                max_ts: i64::MIN,
-            },
-            groups: Vec::with_capacity(4),
-        }
-    }
-}
-
 #[derive(Debug)]
 pub struct MemCache {
     tf_id: u32,
@@ -372,7 +372,7 @@ impl MemCache {
         let entry = self.partions[index]
             .write()
             .entry(sid)
-            .or_insert_with(|| Arc::new(RwLock::new(SeriesData::default())))
+            .or_insert_with(|| Arc::new(RwLock::new(SeriesData::new(sid))))
             .clone();
 
         entry.write().write(group);
@@ -386,37 +386,14 @@ impl MemCache {
         value_predicate: impl FnMut(&FieldVal) -> bool,
         handle_data: impl FnMut(DataType),
     ) {
-        let (field_id, sid) = split_id(field_id);
+        let (column_id, sid) = split_id(field_id);
         let index = (sid as usize) % self.part_count;
         let part = self.partions[index].read();
 
-        match part.get(&sid) {
-            Some(series) => {
-                series
-                    .read()
-                    .read_data(field_id, time_predicate, value_predicate, handle_data)
-            }
-            None => {}
-        }
-    }
-
-    pub fn read_column_data(
-        &self,
-        column_id: ColumnId,
-        mut time_predicate: impl FnMut(Timestamp) -> bool,
-        mut value_predicate: impl FnMut(&FieldVal) -> bool,
-        mut handle_data: impl FnMut(DataType),
-    ) {
-        for part in self.partions.iter() {
-            let part = part.read();
-            for (_, series) in part.iter() {
-                series.read().read_data(
-                    column_id,
-                    &mut time_predicate,
-                    &mut value_predicate,
-                    &mut handle_data,
-                );
-            }
+        if let Some(series) = part.get(&sid) {
+            series
+                .read()
+                .read_data(column_id, time_predicate, value_predicate, handle_data)
         }
     }
 

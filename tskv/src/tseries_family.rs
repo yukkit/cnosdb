@@ -615,33 +615,6 @@ impl CacheGroup {
             handle_data,
         );
     }
-
-    pub fn read_column_data(
-        &self,
-        column_id: ColumnId,
-        mut time_predicate: impl FnMut(Timestamp) -> bool,
-        mut value_predicate: impl FnMut(&FieldVal) -> bool,
-        mut handle_data: impl FnMut(DataType),
-    ) {
-        self.immut_cache
-            .iter()
-            .filter(|m| !m.read().flushed)
-            .for_each(|m| {
-                m.read().read_column_data(
-                    column_id,
-                    &mut time_predicate,
-                    &mut value_predicate,
-                    &mut handle_data,
-                );
-            });
-
-        self.mut_cache.read().read_column_data(
-            column_id,
-            time_predicate,
-            value_predicate,
-            handle_data,
-        );
-    }
 }
 
 #[derive(Debug)]
@@ -672,126 +645,141 @@ impl SuperVersion {
 
     pub async fn count_by_predicates(
         &self,
+        series_ids: &[SeriesId],
         column_id: ColumnId,
         sorted_time_ranges: Arc<Vec<TimeRange>>,
     ) -> Result<u64> {
         trace!("Selecting count for column: {}", column_id);
-        let time_predicate = |ts| {
-            sorted_time_ranges
-                .iter()
-                .any(|tr| tr.is_boundless() || tr.contains(ts))
-        };
 
-        let mut cached_timestamps = HashSet::new();
-        let mut cached_time_range = TimeRange::new(i64::MAX, i64::MIN);
-        self.caches.read_column_data(
-            column_id,
-            time_predicate,
-            |_| true,
-            |d| {
-                let ts = d.timestamp();
-                cached_time_range.min_ts = cached_time_range.min_ts.min(ts);
-                cached_time_range.max_ts = cached_time_range.max_ts.max(ts);
-                cached_timestamps.insert(ts);
-            },
-        );
-        let cached_timestamps = Arc::new(cached_timestamps);
-        let cached_time_range = Arc::new(cached_time_range);
+        for series_id in series_ids {}
 
-        let mut reader_blk_meta_trs: Vec<(Arc<TsmReader>, Arc<BlockMeta>, TimeRange, bool)> =
-            Vec::new();
+        struct ReadTask {
+            tsm_reader: Arc<TsmReader>,
+            block_meta: Arc<BlockMeta>,
+            time_range: TimeRange,
+            included: bool,
+        }
 
-        for lv in self.version.levels_info.iter() {
-            let mut overlaped = false;
-            for tr in sorted_time_ranges.iter() {
-                if lv.time_range.overlaps(tr) {
-                    overlaped = true;
-                    break;
-                }
-            }
-            if !overlaped {
-                trace!(
-                    "Skipped level {}({}, {})",
-                    lv.level,
-                    lv.time_range.min_ts,
-                    lv.time_range.max_ts
-                );
-                continue;
-            }
-            trace!(
-                "Selecting level {}({}, {})",
-                lv.level,
-                lv.time_range.min_ts,
-                lv.time_range.max_ts
-            );
-            for cf in lv.files.iter() {
-                for tr in sorted_time_ranges.iter() {
-                    if cf.time_range.overlaps(tr) {
+        fn collect_column_files(
+            super_version: &SuperVersion,
+            sorted_time_ranges: &[TimeRange],
+        ) -> Vec<Arc<ColumnFile>> {
+            let mut files = Vec::new();
+
+            for lv in super_version.version.levels_info.iter() {
+                let mut overlaped = false;
+                for tr in sorted_time_ranges {
+                    if lv.time_range.overlaps(tr) {
                         overlaped = true;
                         break;
                     }
                 }
                 if !overlaped {
-                    trace!(
-                        "Skipped file {}-{}({}, {})",
-                        cf.level,
-                        cf.file_id,
-                        lv.time_range.min_ts,
-                        lv.time_range.max_ts
-                    );
                     continue;
                 }
-                let path = cf.file_path();
-                let reader = self.version.get_tsm_reader(&path).await?;
-                for idx in reader.index_iterator() {
-                    let (col_id, _) = model_utils::split_id(idx.field_id());
-                    if col_id == column_id {
-                        for blk_meta in idx.block_iterator() {
-                            let blk_tr = (blk_meta.min_ts(), blk_meta.max_ts()).into();
-                            let mut tr_cmp = TimeRangeCmp::NoIntersection;
-                            for tr in sorted_time_ranges.iter() {
-                                if tr.includes(&blk_tr) {
-                                    // Block is included by conditions, needn't to decode.
-                                    tr_cmp = TimeRangeCmp::Include;
-                                    break;
-                                } else if tr.overlaps(&blk_tr) {
-                                    tr_cmp = TimeRangeCmp::Overlap;
-                                }
-                            }
-                            if tr_cmp != TimeRangeCmp::NoIntersection {
-                                reader_blk_meta_trs.push((
-                                    reader.clone(),
-                                    Arc::new(blk_meta),
-                                    blk_tr,
-                                    tr_cmp == TimeRangeCmp::Include,
-                                ));
-                            }
+                for cf in lv.files.iter() {
+                    for tr in sorted_time_ranges {
+                        if cf.time_range.overlaps(tr) {
+                            files.push(cf.clone());
+                            break;
                         }
                     }
                 }
             }
+            files
         }
 
-        reader_blk_meta_trs.sort_by(|a, b| a.1.cmp(&b.1).reverse());
+        async fn collect_field_read_tasks(
+            super_version: &SuperVersion,
+            files: &[Arc<ColumnFile>],
+            field_id: FieldId,
+            sorted_time_ranges: &[TimeRange],
+        ) -> Result<Vec<ReadTask>> {
+            let mut read_tasks: Vec<ReadTask> = Vec::new();
 
-        let count = Arc::new(AtomicU64::new(cached_timestamps.len() as u64));
+            for cf in files {
+                let path = cf.file_path();
+                let reader = super_version.version.get_tsm_reader(&path).await?;
+                for idx in reader.index_iterator_opt(field_id) {
+                    for blk_meta in idx.block_iterator() {
+                        let blk_tr = (blk_meta.min_ts(), blk_meta.max_ts()).into();
+                        let mut tr_cmp = TimeRangeCmp::NoIntersection;
+                        for tr in sorted_time_ranges.iter() {
+                            if tr.includes(&blk_tr) {
+                                // Block is included by conditions, needn't to decode.
+                                tr_cmp = TimeRangeCmp::Include;
+                                break;
+                            } else if tr.overlaps(&blk_tr) {
+                                tr_cmp = TimeRangeCmp::Overlap;
+                            }
+                        }
+                        if tr_cmp != TimeRangeCmp::NoIntersection {
+                            read_tasks.push(ReadTask {
+                                tsm_reader: reader.clone(),
+                                block_meta: Arc::new(blk_meta),
+                                time_range: blk_tr,
+                                included: tr_cmp == TimeRangeCmp::Include,
+                            });
+                        }
+                    }
+                }
+            }
 
-        async fn async_count_timestamps(
-            reader_blk_metas: Vec<(Arc<TsmReader>, Arc<BlockMeta>, bool)>,
+            read_tasks.sort_by(|a, b| a.time_range.cmp(&b.time_range).reverse());
+            Ok(read_tasks)
+        }
+
+        fn count_field_in_caches(
+            super_version: &SuperVersion,
+            field_id: FieldId,
+            sorted_time_ranges: &[TimeRange],
+        ) -> (u64, HashSet<i64>, TimeRange) {
+            let time_predicate = |ts| {
+                sorted_time_ranges
+                    .iter()
+                    .any(|tr| tr.is_boundless() || tr.contains(ts))
+            };
+            let mut cached_timestamps: HashSet<i64> = HashSet::new();
+            let mut cached_time_range = TimeRange::new(i64::MAX, i64::MIN);
+            super_version.caches.read_field_data(
+                field_id,
+                time_predicate,
+                |_| true,
+                |d| {
+                    let ts = d.timestamp();
+                    cached_time_range.min_ts = cached_time_range.min_ts.min(ts);
+                    cached_time_range.max_ts = cached_time_range.max_ts.max(ts);
+                    cached_timestamps.insert(ts);
+                },
+            );
+
+            (
+                cached_timestamps.len() as u64,
+                cached_timestamps,
+                cached_time_range,
+            )
+        }
+
+        async fn count_field_in_files(
+            reader_blk_metas: Vec<ReadTask>,
             count: Arc<AtomicU64>,
             time_ranges: Arc<Vec<TimeRange>>,
             cached_timestamps: Arc<HashSet<Timestamp>>,
             cached_time_range: Arc<TimeRange>,
         ) -> Result<()> {
-            let mut dbg_blk_meta_info = String::with_capacity(128);
             let mut jh_vec = Vec::with_capacity(reader_blk_metas.len());
-            for (reader, blk_meta, _) in reader_blk_metas {
-                dbg_blk_meta_info
-                    .push_str(format!(" ({}, {})", blk_meta.min_ts(), blk_meta.max_ts()).as_str());
-                let jh = tokio::spawn(async move { reader.get_data_block(&blk_meta).await });
+            for read_task in reader_blk_metas {
+                // let tsm_reader = read_task.tsm_reader.clone();
+                // let block_meta = read_task.block_meta.clone();
+                let jh = tokio::spawn(async move {
+                    read_task
+                        .tsm_reader
+                        .get_data_block(&read_task.block_meta)
+                        .await
+                });
                 jh_vec.push(jh);
             }
-            let mut ts_set: HashSet<i64> = HashSet::with_capacity(1000);
+            let mut ts_set: HashSet<Timestamp> = HashSet::new();
             for jh in jh_vec {
                 let blk = jh.await.unwrap();
                 let blk = blk.unwrap();
@@ -860,31 +848,54 @@ impl SuperVersion {
             Ok(())
         }
 
-        let mut jh_vec = Vec::new();
+        let column_files = collect_column_files(self, &sorted_time_ranges);
+        let mut count_sum = 0_u64;
+        for series_id in series_ids {
+            let field_id = model_utils::unite_id(column_id, *series_id);
 
-        trace!("Printing selected fiels and blocks:");
-        let mut grouped_tr = TimeRange::new(i64::MAX, i64::MIN);
-        let mut grouped_reader_blk_metas: Vec<(Arc<TsmReader>, Arc<BlockMeta>, bool)> = Vec::new();
-        for (reader, blk, blk_tr, included) in reader_blk_meta_trs {
-            trace!(
-                "file: {} -> count: {}, time_range({}, {})",
-                reader.file_id(),
-                blk.count(),
-                blk.min_ts(),
-                blk.max_ts()
-            );
-            if grouped_reader_blk_metas.is_empty() || grouped_tr.overlaps(&blk_tr) {
-                // There is no grouped blocks to decode, or still grouping blocks.
-                grouped_tr.merge(&blk_tr);
-            } else {
-                grouped_tr = blk_tr;
-                if grouped_reader_blk_metas.len() == 1 {
-                    // Only 1 grouped block, maybe no need to decode it.
-                    let reader_blk_metas = std::mem::take(&mut grouped_reader_blk_metas);
-                    let b = reader_blk_metas.first().unwrap();
-                    if cached_time_range.overlaps(&b.1.time_range()) || !b.2 {
-                        // Block overlaps with cached data or conditions, need to decode it to remove duplicates.
-                        let jh = tokio::spawn(async_count_timestamps(
+            let reader_blk_meta_trs =
+                collect_field_read_tasks(self, &column_files, field_id, &sorted_time_ranges)
+                    .await?;
+
+            let (count, cached_timestamps, cached_time_range) =
+                count_field_in_caches(self, field_id, &sorted_time_ranges);
+            let count = Arc::new(AtomicU64::new(count));
+            let cached_timestamps = Arc::new(cached_timestamps);
+            let cached_time_range = Arc::new(cached_time_range);
+
+            let mut jh_vec = Vec::new();
+
+            trace!("Printing selected fiels and blocks:");
+            let mut grouped_tr = TimeRange::new(i64::MAX, i64::MIN);
+            let mut grouped_reader_blk_metas: Vec<ReadTask> = Vec::new();
+            for read_task in reader_blk_meta_trs {
+                if grouped_reader_blk_metas.is_empty() || grouped_tr.overlaps(&read_task.time_range)
+                {
+                    // There is no grouped blocks to decode, or still grouping blocks.
+                    grouped_tr.merge(&read_task.time_range);
+                } else {
+                    grouped_tr = read_task.time_range;
+                    if grouped_reader_blk_metas.len() == 1 {
+                        // Only 1 grouped block, maybe no need to decode it.
+                        let reader_blk_metas = std::mem::take(&mut grouped_reader_blk_metas);
+                        let b = reader_blk_metas.first().unwrap();
+                        if cached_time_range.overlaps(&b.block_meta.time_range()) || !b.included {
+                            // Block overlaps with cached data or conditions, need to decode it to remove duplicates.
+                            let jh = tokio::spawn(count_field_in_files(
+                                reader_blk_metas,
+                                count.clone(),
+                                sorted_time_ranges.clone(),
+                                cached_timestamps.clone(),
+                                cached_time_range.clone(),
+                            ));
+                            jh_vec.push(jh);
+                        } else {
+                            count.fetch_add(b.block_meta.count() as u64, Ordering::SeqCst);
+                        }
+                    } else {
+                        // There are grouped blocks which have overlaped time range, need to decode them.
+                        let reader_blk_metas = std::mem::take(&mut grouped_reader_blk_metas);
+                        let jh = tokio::spawn(count_field_in_files(
                             reader_blk_metas,
                             count.clone(),
                             sorted_time_ranges.clone(),
@@ -892,48 +903,37 @@ impl SuperVersion {
                             cached_time_range.clone(),
                         ));
                         jh_vec.push(jh);
-                    } else {
-                        count.fetch_add(b.1.count() as u64, Ordering::SeqCst);
                     }
-                } else {
-                    // There are grouped blocks which have overlaped time range, need to decode them.
-                    let reader_blk_metas = std::mem::take(&mut grouped_reader_blk_metas);
-                    let jh = tokio::spawn(async_count_timestamps(
-                        reader_blk_metas,
-                        count.clone(),
-                        sorted_time_ranges.clone(),
-                        cached_timestamps.clone(),
-                        cached_time_range.clone(),
-                    ));
-                    jh_vec.push(jh);
+                }
+                grouped_reader_blk_metas.push(read_task);
+            }
+            if !grouped_reader_blk_metas.is_empty() {
+                let jh = tokio::spawn(count_field_in_files(
+                    grouped_reader_blk_metas,
+                    count.clone(),
+                    sorted_time_ranges.clone(),
+                    cached_timestamps.clone(),
+                    cached_time_range.clone(),
+                ));
+                jh_vec.push(jh);
+            }
+
+            for jh in jh_vec {
+                match jh.await {
+                    Ok(Ok(_)) => continue,
+                    Ok(Err(e)) => return Err(e),
+                    Err(e) => {
+                        return Err(Error::CommonError {
+                            reason: "Failed to get block for counting".to_string(),
+                        })
+                    }
                 }
             }
-            grouped_reader_blk_metas.push((reader.clone(), blk, included));
-        }
-        if !grouped_reader_blk_metas.is_empty() {
-            let jh = tokio::spawn(async_count_timestamps(
-                grouped_reader_blk_metas,
-                count.clone(),
-                sorted_time_ranges,
-                cached_timestamps.clone(),
-                cached_time_range.clone(),
-            ));
-            jh_vec.push(jh);
+
+            count_sum += count.load(Ordering::Relaxed);
         }
 
-        for jh in jh_vec {
-            match jh.await {
-                Ok(Ok(_)) => continue,
-                Ok(Err(e)) => return Err(e),
-                Err(e) => {
-                    return Err(Error::CommonError {
-                        reason: "Failed to get block for counting".to_string(),
-                    })
-                }
-            }
-        }
-
-        Ok(count.load(Ordering::Relaxed))
+        Ok(count_sum)
     }
 }
 
@@ -1279,7 +1279,7 @@ mod test {
     use trace::{error, info};
 
     use super::{ColumnFile, LevelInfo, SuperVersion};
-    use crate::compaction::flush_tests::default_with_field_id;
+    use crate::compaction::flush_tests::default_table_schema;
     use crate::compaction::test::write_data_blocks_to_column_file;
     use crate::compaction::{run_flush_memtable_job, FlushReq};
     use crate::context::GlobalContext;
@@ -1352,7 +1352,7 @@ mod test {
         ];
         let tsm_reader_cache = Arc::new(ShardedCache::with_capacity(16));
         #[rustfmt::skip]
-        let version = Version::new(1, database, opt.storage.clone(), 1, levels, 3100, tsm_reader_cache.clone());
+        let version = Version::new(1, database, opt.storage.clone(), 1, levels, 3100, tsm_reader_cache);
         let mut version_edits = Vec::new();
         let mut ve = VersionEdit::new(1);
         #[rustfmt::skip]
@@ -1432,7 +1432,7 @@ mod test {
         ];
         let tsm_reader_cache = Arc::new(ShardedCache::with_capacity(16));
         #[rustfmt::skip]
-        let version = Version::new(1, database, opt.storage.clone(), 1, levels, 3150, tsm_reader_cache.clone());
+        let version = Version::new(1, database, opt.storage.clone(), 1, levels, 3150, tsm_reader_cache);
 
         let mut version_edits = Vec::new();
         let mut ve = VersionEdit::new(1);
@@ -1524,16 +1524,16 @@ mod test {
         #[rustfmt::skip]
         let data = vec![
             HashMap::from([
-                (model_utils::unite_id(1, 0), vec![DataBlock::I64 { ts: vec![1, 2, 3, 4], val: vec![1, 1, 1, 1], enc: DataBlockEncoding::default() }]),
-                (model_utils::unite_id(2, 0), vec![DataBlock::I64 { ts: vec![1, 2, 3, 4], val: vec![1, 1, 1, 1], enc: DataBlockEncoding::default() }]),
+                (model_utils::unite_id(1, 1), vec![DataBlock::I64 { ts: vec![1, 2, 3, 4], val: vec![1, 1, 1, 1], enc: DataBlockEncoding::default() }]),
+                (model_utils::unite_id(1, 2), vec![DataBlock::I64 { ts: vec![10, 20, 30, 40], val: vec![1, 1, 1, 1], enc: DataBlockEncoding::default() }]),
             ]),
             HashMap::from([
-                (model_utils::unite_id(1, 0), vec![DataBlock::I64 { ts: vec![4, 5, 6], val: vec![1, 1, 1], enc: DataBlockEncoding::default() }]),
-                (model_utils::unite_id(2, 0), vec![DataBlock::I64 { ts: vec![4, 5, 6], val: vec![1, 1, 1], enc: DataBlockEncoding::default() }]),
+                (model_utils::unite_id(1, 1), vec![DataBlock::I64 { ts: vec![4, 5, 6], val: vec![1, 1, 1], enc: DataBlockEncoding::default() }]),
+                (model_utils::unite_id(1, 2), vec![DataBlock::I64 { ts: vec![40, 50, 60], val: vec![1, 1, 1], enc: DataBlockEncoding::default() }]),
             ]),
             HashMap::from([
-                (model_utils::unite_id(1, 0), vec![DataBlock::I64 { ts: vec![7, 8, 9], val: vec![1, 1, 1], enc: DataBlockEncoding::default() }]),
-                (model_utils::unite_id(2, 0), vec![DataBlock::I64 { ts: vec![7, 8, 9], val: vec![1, 1, 1], enc: DataBlockEncoding::default() }]),
+                (model_utils::unite_id(1, 1), vec![DataBlock::I64 { ts: vec![7, 8, 9], val: vec![1, 1, 1], enc: DataBlockEncoding::default() }]),
+                (model_utils::unite_id(1, 2), vec![DataBlock::I64 { ts: vec![70, 80, 90], val: vec![1, 1, 1], enc: DataBlockEncoding::default() }]),
             ]),
         ];
 
@@ -1559,27 +1559,35 @@ mod test {
 
         #[rustfmt::skip]
         let _skip_fmt = {
-            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(i64::MIN, i64::MAX).into()])).await.unwrap(), 9);
-            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(0, 0).into()])).await.unwrap(), 0);
-            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(1, 1).into()])).await.unwrap(), 1);
-            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(1, 4).into()])).await.unwrap(), 4);
-            assert_eq!(version.count_by_predicates(2, Arc::new(vec![(1, 4).into()])).await.unwrap(), 4);
-            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(1, 5).into()])).await.unwrap(), 5);
-            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(4, 4).into()])).await.unwrap(), 1);
-            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(4, 5).into()])).await.unwrap(), 2);
-            assert_eq!(version.count_by_predicates(2, Arc::new(vec![(4, 5).into()])).await.unwrap(), 2);
-            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(4, 7).into()])).await.unwrap(), 4);
-            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(10, 10).into()])).await.unwrap(), 0);
+            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(i64::MIN, i64::MAX).into()])).await.unwrap(), 9);
+            assert_eq!(version.count_by_predicates(&[1, 2], 1, Arc::new(vec![(i64::MIN, i64::MAX).into()])).await.unwrap(), 18);
 
-            assert_eq!(version.count_by_predicates(1, Arc::new(
+            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(0, 0).into()])).await.unwrap(), 0);
+            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(1, 1).into()])).await.unwrap(), 1);
+            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(1, 4).into()])).await.unwrap(), 4);
+            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(1, 5).into()])).await.unwrap(), 5);
+            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(4, 4).into()])).await.unwrap(), 1);
+            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(4, 5).into()])).await.unwrap(), 2);
+            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(4, 7).into()])).await.unwrap(), 4);
+            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(10, 10).into()])).await.unwrap(), 0);
+
+            assert_eq!(version.count_by_predicates(&[2], 1, Arc::new(vec![(10, 40).into()])).await.unwrap(), 4);
+            assert_eq!(version.count_by_predicates(&[2], 1, Arc::new(vec![(40, 50).into()])).await.unwrap(), 2);
+
+            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(
                 vec![(2, 3).into(), (5, 5).into(), (8, 8).into()]
             )).await.unwrap(), 4);
-            assert_eq!(version.count_by_predicates(1, Arc::new(
+            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(
                 vec![(4, 5).into(), (6, 8).into()]
             )).await.unwrap(), 5);
-            assert_eq!(version.count_by_predicates(1, Arc::new(
+            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(
                 vec![(1, 3).into(), (2, 4).into(), (3, 7).into()]
             )).await.unwrap(), 7);
+
+            assert_eq!(version.count_by_predicates(&[1, 2], 1, Arc::new(
+                vec![(1, 3).into(), (2, 4).into(), (3, 7).into(),
+                     (10, 30).into(), (20, 40).into(), (30, 70).into()]
+            )).await.unwrap(), 14);
             "skip_fmt"
         };
     }
@@ -1594,11 +1602,15 @@ mod test {
         let cache_group = {
             let mut caches = vec![MemCache::new(1, 16, 0), MemCache::new(1, 16, 0), MemCache::new(1, 16, 0)];
             // cache, sid, schema_id, schema, time_range, put_none
-            put_rows_to_cache(&mut caches[0], 0, 1, default_with_field_id(vec![1, 2]), (1, 4), false);
-            put_rows_to_cache(&mut caches[1], 0, 1, default_with_field_id(vec![1, 2]), (4, 6), false);
-            put_rows_to_cache(&mut caches[2], 0, 1, default_with_field_id(vec![1, 2]), (7, 9), false);
+            put_rows_to_cache(&mut caches[0], 1, 1, default_table_schema(vec![1]), (1, 4), false);
+            put_rows_to_cache(&mut caches[0], 2, 1, default_table_schema(vec![1]), (101, 104), false);
+            put_rows_to_cache(&mut caches[1], 1, 1, default_table_schema(vec![1]), (4, 6), false);
+            put_rows_to_cache(&mut caches[1], 2, 1, default_table_schema(vec![1]), (104, 106), false);
+            put_rows_to_cache(&mut caches[2], 1, 1, default_table_schema(vec![1]), (7, 9), false);
+            put_rows_to_cache(&mut caches[2], 2, 1, default_table_schema(vec![1]), (107, 109), false);
             let mut mut_cache = MemCache::new(1, 16, 0);
-            put_rows_to_cache(&mut mut_cache, 0, 1, default_with_field_id(vec![1, 2]), (11, 15), false);
+            put_rows_to_cache(&mut mut_cache, 1, 1, default_table_schema(vec![1]), (11, 15), false);
+            put_rows_to_cache(&mut mut_cache, 2, 1, default_table_schema(vec![1]), (111, 115), false);
             CacheGroup {
                 mut_cache: Arc::new(RwLock::new(mut_cache)),
                 immut_cache: caches.into_iter().map(|c| Arc::new(RwLock::new(c))).collect(),
@@ -1621,27 +1633,34 @@ mod test {
 
         #[rustfmt::skip]
         let _skip_fmt = {
-            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(i64::MIN, i64::MAX).into()])).await.unwrap(), 14);
-            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(0, 0).into()])).await.unwrap(), 0);
-            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(1, 1).into()])).await.unwrap(), 1);
-            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(1, 4).into()])).await.unwrap(), 4);
-            assert_eq!(version.count_by_predicates(2, Arc::new(vec![(1, 4).into()])).await.unwrap(), 4);
-            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(1, 5).into()])).await.unwrap(), 5);
-            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(4, 4).into()])).await.unwrap(), 1);
-            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(4, 5).into()])).await.unwrap(), 2);
-            assert_eq!(version.count_by_predicates(2, Arc::new(vec![(4, 5).into()])).await.unwrap(), 2);
-            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(4, 7).into()])).await.unwrap(), 4);
-            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(10, 10).into()])).await.unwrap(), 0);
+            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(i64::MIN, i64::MAX).into()])).await.unwrap(), 14);
+            assert_eq!(version.count_by_predicates(&[1, 2], 1, Arc::new(vec![(i64::MIN, i64::MAX).into()])).await.unwrap(), 28);
+            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(0, 0).into()])).await.unwrap(), 0);
+            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(1, 1).into()])).await.unwrap(), 1);
+            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(1, 4).into()])).await.unwrap(), 4);
+            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(1, 5).into()])).await.unwrap(), 5);
+            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(4, 4).into()])).await.unwrap(), 1);
+            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(4, 5).into()])).await.unwrap(), 2);
+            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(4, 7).into()])).await.unwrap(), 4);
+            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(10, 10).into()])).await.unwrap(), 0);
 
-            assert_eq!(version.count_by_predicates(1, Arc::new(
+            assert_eq!(version.count_by_predicates(&[2], 1, Arc::new(vec![(101, 104).into()])).await.unwrap(), 4);
+            assert_eq!(version.count_by_predicates(&[2], 1, Arc::new(vec![(104, 105).into()])).await.unwrap(), 2);
+
+            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(
                 vec![(2, 3).into(), (5, 5).into(), (8, 8).into()]
             )).await.unwrap(), 4);
-            assert_eq!(version.count_by_predicates(1, Arc::new(
+            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(
                 vec![(4, 5).into(), (6, 8).into()]
             )).await.unwrap(), 5);
-            assert_eq!(version.count_by_predicates(1, Arc::new(
+            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(
                 vec![(1, 3).into(), (2, 4).into(), (3, 7).into()]
             )).await.unwrap(), 7);
+
+            assert_eq!(version.count_by_predicates(&[1, 2], 1, Arc::new(
+                vec![(1, 3).into(), (2, 4).into(), (3, 7).into(),
+                     (101, 103).into(), (102, 104).into(), (103, 107).into()]
+            )).await.unwrap(), 14);
             "skip_fmt"
         };
     }
@@ -1655,16 +1674,16 @@ mod test {
         #[rustfmt::skip]
         let data = vec![
             HashMap::from([
-                (model_utils::unite_id(1, 0), vec![DataBlock::I64 { ts: vec![1, 2, 3, 4], val: vec![1, 1, 1, 1], enc: DataBlockEncoding::default() }]),
-                (model_utils::unite_id(2, 0), vec![DataBlock::I64 { ts: vec![1, 2, 3, 4], val: vec![1, 1, 1, 1], enc: DataBlockEncoding::default() }]),
+                (model_utils::unite_id(1, 1), vec![DataBlock::I64 { ts: vec![1, 2, 3, 4], val: vec![1, 1, 1, 1], enc: DataBlockEncoding::default() }]),
+                (model_utils::unite_id(1, 2), vec![DataBlock::I64 { ts: vec![101, 102, 103, 104], val: vec![1, 1, 1, 1], enc: DataBlockEncoding::default() }]),
             ]),
             HashMap::from([
-                (model_utils::unite_id(1, 0), vec![DataBlock::I64 { ts: vec![4, 5, 6], val: vec![1, 1, 1], enc: DataBlockEncoding::default() }]),
-                (model_utils::unite_id(2, 0), vec![DataBlock::I64 { ts: vec![4, 5, 6], val: vec![1, 1, 1], enc: DataBlockEncoding::default() }]),
+                (model_utils::unite_id(1, 1), vec![DataBlock::I64 { ts: vec![4, 5, 6], val: vec![1, 1, 1], enc: DataBlockEncoding::default() }]),
+                (model_utils::unite_id(1, 2), vec![DataBlock::I64 { ts: vec![104, 105, 106], val: vec![1, 1, 1], enc: DataBlockEncoding::default() }]),
             ]),
             HashMap::from([
-                (model_utils::unite_id(1, 0), vec![DataBlock::I64 { ts: vec![7, 8, 9], val: vec![1, 1, 1], enc: DataBlockEncoding::default() }]),
-                (model_utils::unite_id(2, 0), vec![DataBlock::I64 { ts: vec![7, 8, 9], val: vec![1, 1, 1], enc: DataBlockEncoding::default() }]),
+                (model_utils::unite_id(1, 1), vec![DataBlock::I64 { ts: vec![7, 8, 9], val: vec![1, 1, 1], enc: DataBlockEncoding::default() }]),
+                (model_utils::unite_id(1, 2), vec![DataBlock::I64 { ts: vec![107, 108, 109], val: vec![1, 1, 1], enc: DataBlockEncoding::default() }]),
             ]),
         ];
 
@@ -1672,11 +1691,15 @@ mod test {
         let cache_group = {
             let mut caches = vec![MemCache::new(1, 16, 0), MemCache::new(1, 16, 0), MemCache::new(1, 16, 0)];
             // cache, sid, schema_id, schema, time_range, put_none
-            put_rows_to_cache(&mut caches[0], 0, 1, default_with_field_id(vec![1, 2]), (11, 15), false);
-            put_rows_to_cache(&mut caches[1], 0, 1, default_with_field_id(vec![1, 2]), (21, 25), false);
-            put_rows_to_cache(&mut caches[2], 0, 1, default_with_field_id(vec![1, 2]), (31, 35), false);
+            put_rows_to_cache(&mut caches[0], 1, 1, default_table_schema(vec![1]), (11, 15), false);
+            put_rows_to_cache(&mut caches[0], 2, 1, default_table_schema(vec![1]), (111, 115), false);
+            put_rows_to_cache(&mut caches[1], 1, 1, default_table_schema(vec![1]), (21, 25), false);
+            put_rows_to_cache(&mut caches[1], 2, 1, default_table_schema(vec![1]), (121, 125), false);
+            put_rows_to_cache(&mut caches[2], 1, 1, default_table_schema(vec![1]), (31, 35), false);
+            put_rows_to_cache(&mut caches[2], 2, 1, default_table_schema(vec![1]), (131, 135), false);
             let mut mut_cache = MemCache::new(1, 16, 0);
-            put_rows_to_cache(&mut mut_cache, 0, 1, default_with_field_id(vec![1, 2]), (31, 40), false);
+            put_rows_to_cache(&mut mut_cache, 1, 1, default_table_schema(vec![1]), (31, 40), false);
+            put_rows_to_cache(&mut mut_cache, 2, 1, default_table_schema(vec![1]), (131, 140), false);
             CacheGroup {
                 mut_cache: Arc::new(RwLock::new(mut_cache)),
                 immut_cache: caches.into_iter().map(|c| Arc::new(RwLock::new(c))).collect(),
@@ -1702,19 +1725,21 @@ mod test {
 
         #[rustfmt::skip]
         let _skip_fmt = {
-            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(i64::MIN, i64::MAX).into()])).await.unwrap(), 29);
-            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(0, 0).into()])).await.unwrap(), 0);
-            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(1, 1).into()])).await.unwrap(), 1);
-            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(1, 10).into()])).await.unwrap(), 9);
-            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(1, 50).into()])).await.unwrap(), 29);
-            assert_eq!(version.count_by_predicates(2, Arc::new(vec![(5, 10).into()])).await.unwrap(), 5);
-            assert_eq!(version.count_by_predicates(2, Arc::new(vec![(5, 21).into()])).await.unwrap(), 11);
-            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(10, 20).into()])).await.unwrap(), 5);
-            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(10, 50).into()])).await.unwrap(), 20);
-            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(15, 21).into()])).await.unwrap(), 2);
-            assert_eq!(version.count_by_predicates(2, Arc::new(vec![(15, 25).into()])).await.unwrap(), 6);
-            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(40, 40).into()])).await.unwrap(), 1);
-            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(41, 41).into()])).await.unwrap(), 0);
+            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(i64::MIN, i64::MAX).into()])).await.unwrap(), 29);
+            assert_eq!(version.count_by_predicates(&[1, 2], 1, Arc::new(vec![(i64::MIN, i64::MAX).into()])).await.unwrap(), 58);
+            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(0, 0).into()])).await.unwrap(), 0);
+            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(1, 1).into()])).await.unwrap(), 1);
+            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(1, 10).into()])).await.unwrap(), 9);
+            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(1, 50).into()])).await.unwrap(), 29);
+            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(10, 20).into()])).await.unwrap(), 5);
+            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(10, 50).into()])).await.unwrap(), 20);
+            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(15, 21).into()])).await.unwrap(), 2);
+            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(40, 40).into()])).await.unwrap(), 1);
+            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(41, 41).into()])).await.unwrap(), 0);
+
+            assert_eq!(version.count_by_predicates(&[2], 1, Arc::new(vec![(105, 110).into()])).await.unwrap(), 5);
+            assert_eq!(version.count_by_predicates(&[2], 1, Arc::new(vec![(105, 121).into()])).await.unwrap(), 11);
+            assert_eq!(version.count_by_predicates(&[2], 1, Arc::new(vec![(115, 125).into()])).await.unwrap(), 6);
             "skip_fmt"
         };
     }
@@ -1752,7 +1777,7 @@ mod test {
         );
 
         let row_group = RowGroup {
-            schema: default_with_field_id(vec![0, 1, 2]).into(),
+            schema: default_table_schema(vec![0, 1, 2]).into(),
             range: TimeRange {
                 min_ts: 1,
                 max_ts: 100,
@@ -1856,7 +1881,7 @@ mod test {
         let memory_pool: MemoryPoolRef = Arc::new(GreedyMemoryPool::new(1024 * 1024 * 1024));
         let mem = MemCache::new(0, 1000, 0, &memory_pool);
         let row_group = RowGroup {
-            schema: default_with_field_id(vec![0, 1, 2]).into(),
+            schema: default_table_schema(vec![0, 1, 2]).into(),
             range: TimeRange {
                 min_ts: 1,
                 max_ts: 100,
