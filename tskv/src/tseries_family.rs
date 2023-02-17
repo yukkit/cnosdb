@@ -9,18 +9,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use config::get_config;
+use datafusion::sql::sqlparser::keywords::MIN;
 use lazy_static::lazy_static;
 use lru_cache::ShardedCache;
 use memory_pool::MemoryPoolRef;
 use models::schema::TableColumn;
-use models::{ColumnId, FieldId, InMemPoint, SchemaId, SeriesId, Timestamp, ValueType};
+use models::{
+    utils as model_utils, ColumnId, FieldId, InMemPoint, SchemaId, SeriesId, Timestamp, ValueType,
+};
 use parking_lot::{Mutex, RwLock};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::watch::Receiver;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-use trace::{debug, error, info, warn};
+use trace::{debug, error, info, trace, warn};
 use utils::BloomFilter;
 
 use crate::compaction::{CompactReq, CompactTask, FlushReq, LevelCompactionPicker, Picker};
@@ -28,10 +31,11 @@ use crate::error::{Error, Result};
 use crate::file_system::file_manager;
 use crate::file_utils::{self, make_delta_file_name, make_tsm_file_name};
 use crate::kv_option::{CacheOptions, Options, StorageOptions};
-use crate::memcache::{DataType, MemCache, RowGroup};
+use crate::memcache::{DataType, FieldVal, MemCache, RowGroup};
 use crate::summary::{CompactMeta, VersionEdit};
 use crate::tsm::{
-    BlockMetaIterator, ColumnReader, DataBlock, Index, IndexReader, TsmReader, TsmTombstone,
+    BlockMeta, BlockMetaIterator, ColumnReader, DataBlock, Index, IndexReader, TsmReader,
+    TsmTombstone,
 };
 use crate::{ColumnFileId, LevelId, TseriesFamilyId};
 
@@ -128,6 +132,16 @@ impl Ord for TimeRange {
             other => other,
         }
     }
+}
+
+#[derive(PartialEq, Eq)]
+pub enum TimeRangeCmp {
+    /// A has no intersection with B
+    NoIntersection,
+    /// A includes B
+    Include,
+    /// A overlaps with B
+    Overlap,
 }
 
 #[derive(Debug)]
@@ -574,6 +588,62 @@ pub struct CacheGroup {
     pub immut_cache: Vec<Arc<RwLock<MemCache>>>,
 }
 
+impl CacheGroup {
+    pub fn read_field_data(
+        &self,
+        field_id: FieldId,
+        mut time_predicate: impl FnMut(Timestamp) -> bool,
+        mut value_predicate: impl FnMut(&FieldVal) -> bool,
+        mut handle_data: impl FnMut(DataType),
+    ) {
+        self.immut_cache
+            .iter()
+            .filter(|m| !m.read().flushed)
+            .for_each(|m| {
+                m.read().read_field_data(
+                    field_id,
+                    &mut time_predicate,
+                    &mut value_predicate,
+                    &mut handle_data,
+                );
+            });
+
+        self.mut_cache.read().read_field_data(
+            field_id,
+            time_predicate,
+            value_predicate,
+            handle_data,
+        );
+    }
+
+    pub fn read_column_data(
+        &self,
+        column_id: ColumnId,
+        mut time_predicate: impl FnMut(Timestamp) -> bool,
+        mut value_predicate: impl FnMut(&FieldVal) -> bool,
+        mut handle_data: impl FnMut(DataType),
+    ) {
+        self.immut_cache
+            .iter()
+            .filter(|m| !m.read().flushed)
+            .for_each(|m| {
+                m.read().read_column_data(
+                    column_id,
+                    &mut time_predicate,
+                    &mut value_predicate,
+                    &mut handle_data,
+                );
+            });
+
+        self.mut_cache.read().read_column_data(
+            column_id,
+            time_predicate,
+            value_predicate,
+            handle_data,
+        );
+    }
+}
+
 #[derive(Debug)]
 pub struct SuperVersion {
     pub ts_family_id: u32,
@@ -598,6 +668,272 @@ impl SuperVersion {
             version,
             version_number,
         }
+    }
+
+    pub async fn count_by_predicates(
+        &self,
+        column_id: ColumnId,
+        sorted_time_ranges: Arc<Vec<TimeRange>>,
+    ) -> Result<u64> {
+        trace!("Selecting count for column: {}", column_id);
+        let time_predicate = |ts| {
+            sorted_time_ranges
+                .iter()
+                .any(|tr| tr.is_boundless() || tr.contains(ts))
+        };
+
+        let mut cached_timestamps = HashSet::new();
+        let mut cached_time_range = TimeRange::new(i64::MAX, i64::MIN);
+        self.caches.read_column_data(
+            column_id,
+            time_predicate,
+            |_| true,
+            |d| {
+                let ts = d.timestamp();
+                cached_time_range.min_ts = cached_time_range.min_ts.min(ts);
+                cached_time_range.max_ts = cached_time_range.max_ts.max(ts);
+                cached_timestamps.insert(ts);
+            },
+        );
+        let cached_timestamps = Arc::new(cached_timestamps);
+        let cached_time_range = Arc::new(cached_time_range);
+
+        let mut reader_blk_meta_trs: Vec<(Arc<TsmReader>, Arc<BlockMeta>, TimeRange, bool)> =
+            Vec::new();
+
+        for lv in self.version.levels_info.iter() {
+            let mut overlaped = false;
+            for tr in sorted_time_ranges.iter() {
+                if lv.time_range.overlaps(tr) {
+                    overlaped = true;
+                    break;
+                }
+            }
+            if !overlaped {
+                trace!(
+                    "Skipped level {}({}, {})",
+                    lv.level,
+                    lv.time_range.min_ts,
+                    lv.time_range.max_ts
+                );
+                continue;
+            }
+            trace!(
+                "Selecting level {}({}, {})",
+                lv.level,
+                lv.time_range.min_ts,
+                lv.time_range.max_ts
+            );
+            for cf in lv.files.iter() {
+                for tr in sorted_time_ranges.iter() {
+                    if cf.time_range.overlaps(tr) {
+                        overlaped = true;
+                        break;
+                    }
+                }
+                if !overlaped {
+                    trace!(
+                        "Skipped file {}-{}({}, {})",
+                        cf.level,
+                        cf.file_id,
+                        lv.time_range.min_ts,
+                        lv.time_range.max_ts
+                    );
+                    continue;
+                }
+                let path = cf.file_path();
+                let reader = self.version.get_tsm_reader(&path).await?;
+                for idx in reader.index_iterator() {
+                    let (col_id, _) = model_utils::split_id(idx.field_id());
+                    if col_id == column_id {
+                        for blk_meta in idx.block_iterator() {
+                            let blk_tr = (blk_meta.min_ts(), blk_meta.max_ts()).into();
+                            let mut tr_cmp = TimeRangeCmp::NoIntersection;
+                            for tr in sorted_time_ranges.iter() {
+                                if tr.includes(&blk_tr) {
+                                    // Block is included by conditions, needn't to decode.
+                                    tr_cmp = TimeRangeCmp::Include;
+                                    break;
+                                } else if tr.overlaps(&blk_tr) {
+                                    tr_cmp = TimeRangeCmp::Overlap;
+                                }
+                            }
+                            if tr_cmp != TimeRangeCmp::NoIntersection {
+                                reader_blk_meta_trs.push((
+                                    reader.clone(),
+                                    Arc::new(blk_meta),
+                                    blk_tr,
+                                    tr_cmp == TimeRangeCmp::Include,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        reader_blk_meta_trs.sort_by(|a, b| a.1.cmp(&b.1).reverse());
+
+        let count = Arc::new(AtomicU64::new(cached_timestamps.len() as u64));
+
+        async fn async_count_timestamps(
+            reader_blk_metas: Vec<(Arc<TsmReader>, Arc<BlockMeta>, bool)>,
+            count: Arc<AtomicU64>,
+            time_ranges: Arc<Vec<TimeRange>>,
+            cached_timestamps: Arc<HashSet<Timestamp>>,
+            cached_time_range: Arc<TimeRange>,
+        ) -> Result<()> {
+            let mut dbg_blk_meta_info = String::with_capacity(128);
+            let mut jh_vec = Vec::with_capacity(reader_blk_metas.len());
+            for (reader, blk_meta, _) in reader_blk_metas {
+                dbg_blk_meta_info
+                    .push_str(format!(" ({}, {})", blk_meta.min_ts(), blk_meta.max_ts()).as_str());
+                let jh = tokio::spawn(async move { reader.get_data_block(&blk_meta).await });
+                jh_vec.push(jh);
+            }
+            let mut ts_set: HashSet<i64> = HashSet::with_capacity(1000);
+            for jh in jh_vec {
+                let blk = jh.await.unwrap();
+                let blk = blk.unwrap();
+                if let Some(tr) = blk.time_range() {
+                    let tr: TimeRange = tr.into();
+                    let timestamps = blk.ts();
+                    if cached_time_range.overlaps(&tr) {
+                        // Time range of this DataBlock overlaps with cached timestamps,
+                        // need to find the difference and add to count directly.
+                        let mut c = 0_u64;
+                        for ts in timestamps {
+                            if !cached_timestamps.contains(ts) {
+                                c += 1;
+                            }
+                        }
+                        count.fetch_add(c, Ordering::SeqCst);
+                    } else {
+                        // Cached timestmaps not contains this DataBlock.
+                        for tr in time_ranges.iter() {
+                            let low = match timestamps.binary_search(&tr.min_ts) {
+                                Ok(l) => l,
+                                Err(l) => {
+                                    if l == 0 {
+                                        // Lowest timestamp is smaller than the first timestamp.
+                                        0
+                                    } else if l < timestamps.len() {
+                                        if timestamps[l] >= tr.min_ts {
+                                            l
+                                        } else {
+                                            l + 1
+                                        }
+                                    } else {
+                                        // Lowest timestamp is greater than the last timestamp.
+                                        break;
+                                    }
+                                }
+                            };
+                            let high = match timestamps.binary_search(&tr.max_ts) {
+                                Ok(h) => h,
+                                Err(h) => {
+                                    if h == 0 {
+                                        // Highest timestamp is smaller than the first timestamp.
+                                        continue;
+                                    } else if h < timestamps.len() {
+                                        if timestamps[h] <= tr.max_ts {
+                                            h - 1
+                                        } else {
+                                            h
+                                        }
+                                    } else {
+                                        // Highest timestamp is greater than the last timestamp.
+                                        timestamps.len() - 1
+                                    }
+                                }
+                            };
+                            ts_set.extend(timestamps[low..=high].iter());
+                        }
+                    }
+                } else {
+                    // DataBlock is empty.
+                    continue;
+                }
+            }
+            count.fetch_add(ts_set.len() as u64, Ordering::SeqCst);
+
+            Ok(())
+        }
+
+        let mut jh_vec = Vec::new();
+
+        trace!("Printing selected fiels and blocks:");
+        let mut grouped_tr = TimeRange::new(i64::MAX, i64::MIN);
+        let mut grouped_reader_blk_metas: Vec<(Arc<TsmReader>, Arc<BlockMeta>, bool)> = Vec::new();
+        for (reader, blk, blk_tr, included) in reader_blk_meta_trs {
+            trace!(
+                "file: {} -> count: {}, time_range({}, {})",
+                reader.file_id(),
+                blk.count(),
+                blk.min_ts(),
+                blk.max_ts()
+            );
+            if grouped_reader_blk_metas.is_empty() || grouped_tr.overlaps(&blk_tr) {
+                // There is no grouped blocks to decode, or still grouping blocks.
+                grouped_tr.merge(&blk_tr);
+            } else {
+                grouped_tr = blk_tr;
+                if grouped_reader_blk_metas.len() == 1 {
+                    // Only 1 grouped block, maybe no need to decode it.
+                    let reader_blk_metas = std::mem::take(&mut grouped_reader_blk_metas);
+                    let b = reader_blk_metas.first().unwrap();
+                    if cached_time_range.overlaps(&b.1.time_range()) || !b.2 {
+                        // Block overlaps with cached data or conditions, need to decode it to remove duplicates.
+                        let jh = tokio::spawn(async_count_timestamps(
+                            reader_blk_metas,
+                            count.clone(),
+                            sorted_time_ranges.clone(),
+                            cached_timestamps.clone(),
+                            cached_time_range.clone(),
+                        ));
+                        jh_vec.push(jh);
+                    } else {
+                        count.fetch_add(b.1.count() as u64, Ordering::SeqCst);
+                    }
+                } else {
+                    // There are grouped blocks which have overlaped time range, need to decode them.
+                    let reader_blk_metas = std::mem::take(&mut grouped_reader_blk_metas);
+                    let jh = tokio::spawn(async_count_timestamps(
+                        reader_blk_metas,
+                        count.clone(),
+                        sorted_time_ranges.clone(),
+                        cached_timestamps.clone(),
+                        cached_time_range.clone(),
+                    ));
+                    jh_vec.push(jh);
+                }
+            }
+            grouped_reader_blk_metas.push((reader.clone(), blk, included));
+        }
+        if !grouped_reader_blk_metas.is_empty() {
+            let jh = tokio::spawn(async_count_timestamps(
+                grouped_reader_blk_metas,
+                count.clone(),
+                sorted_time_ranges,
+                cached_timestamps.clone(),
+                cached_time_range.clone(),
+            ));
+            jh_vec.push(jh);
+        }
+
+        for jh in jh_vec {
+            match jh.await {
+                Ok(Ok(_)) => continue,
+                Ok(Err(e)) => return Err(e),
+                Err(e) => {
+                    return Err(Error::CommonError {
+                        reason: "Failed to get block for counting".to_string(),
+                    })
+                }
+            }
+        }
+
+        Ok(count.load(Ordering::Relaxed))
     }
 }
 
@@ -936,24 +1272,27 @@ mod test {
     use meta::meta_manager::RemoteMetaManager;
     use meta::MetaRef;
     use models::schema::{DatabaseSchema, TenantOptions};
-    use models::{Timestamp, ValueType};
+    use models::{utils as model_utils, Timestamp, ValueType};
     use parking_lot::{Mutex, RwLock};
     use tokio::sync::mpsc::{self, Receiver};
     use tokio::sync::RwLock as AsyncRwLock;
     use trace::{error, info};
 
-    use super::{ColumnFile, LevelInfo};
+    use super::{ColumnFile, LevelInfo, SuperVersion};
     use crate::compaction::flush_tests::default_with_field_id;
+    use crate::compaction::test::write_data_blocks_to_column_file;
     use crate::compaction::{run_flush_memtable_job, FlushReq};
     use crate::context::GlobalContext;
     use crate::file_system::file_manager;
     use crate::file_utils::{self, make_tsm_file_name};
-    use crate::kv_option::Options;
+    use crate::kv_option::{Options, StorageOptions};
     use crate::kvcore::{COMPACT_REQ_CHANNEL_CAP, SUMMARY_REQ_CHANNEL_CAP};
+    use crate::memcache::test::put_rows_to_cache;
     use crate::memcache::{FieldVal, MemCache, RowData, RowGroup};
     use crate::summary::{CompactMeta, SummaryTask, VersionEdit};
-    use crate::tseries_family::{TimeRange, TseriesFamily, Version};
-    use crate::tsm::TsmTombstone;
+    use crate::tseries_family::{CacheGroup, TimeRange, TseriesFamily, Version};
+    use crate::tsm::codec::DataBlockEncoding;
+    use crate::tsm::{DataBlock, TsmTombstone};
     use crate::version_set::VersionSet;
     use crate::TseriesFamilyId;
 
@@ -985,57 +1324,42 @@ mod test {
         let ts_family_id = 1;
         let tsm_dir = opt.storage.tsm_dir(&database, ts_family_id);
         #[rustfmt::skip]
-            let version = Version {
-            ts_family_id,
-            database: database.clone(),
-            storage_opt: opt.storage.clone(),
-            last_seq: 1,
-            max_level_ts: 3100,
-            levels_info: [
-                LevelInfo::init(database.clone(), 0, 0, opt.storage.clone()),
-                LevelInfo {
-                    files: vec![
-                        Arc::new(ColumnFile::new(3, 1, TimeRange::new(3001, 3100), 100, false, make_tsm_file_name(&tsm_dir, 3))),
-                    ],
-                    database: database.clone(),
-                    tsf_id: 1,
-                    storage_opt: opt.storage.clone(),
-                    level: 1,
-                    cur_size: 100,
-                    max_size: 1000,
-                    time_range: TimeRange::new(3001, 3100),
-                },
-                LevelInfo {
-                    files: vec![
-                        Arc::new(ColumnFile::new(1, 2, TimeRange::new(1, 1000), 1000, false, make_tsm_file_name(&tsm_dir, 1))),
-                        Arc::new(ColumnFile::new(2, 2, TimeRange::new(1001, 2000), 1000, false, make_tsm_file_name(&tsm_dir, 2))),
-                    ],
-                    database: database.clone(),
-                    tsf_id: 1,
-                    storage_opt: opt.storage.clone(),
-                    level: 2,
-                    cur_size: 2000,
-                    max_size: 10000,
-                    time_range: TimeRange::new(1, 2000),
-                },
-                LevelInfo::init(database.clone(), 3, 0, opt.storage.clone()),
-                LevelInfo::init(database, 4, 0, opt.storage.clone()),
-            ],
-            tsm_reader_cache: Arc::new(ShardedCache::with_capacity(1)),
-        };
+        let levels = [
+            LevelInfo::init(database.clone(), 0, 0, opt.storage.clone()),
+            LevelInfo {
+                files: vec![
+                    Arc::new(ColumnFile::new(3, 1, TimeRange::new(3001, 3100), 100, false, make_tsm_file_name(&tsm_dir, 3))),
+                ],
+                database: database.clone(), tsf_id: 1,
+                storage_opt: opt.storage.clone(),
+                level: 1,
+                cur_size: 100, max_size: 1000,
+                time_range: TimeRange::new(3001, 3100),
+            },
+            LevelInfo {
+                files: vec![
+                    Arc::new(ColumnFile::new(1, 2, TimeRange::new(1, 1000), 1000, false, make_tsm_file_name(&tsm_dir, 1))),
+                    Arc::new(ColumnFile::new(2, 2, TimeRange::new(1001, 2000), 1000, false, make_tsm_file_name(&tsm_dir, 2))),
+                ],
+                database: database.clone(), tsf_id: 1,
+                storage_opt: opt.storage.clone(),
+                level: 2,
+                cur_size: 2000, max_size: 10000,
+                time_range: TimeRange::new(1, 2000),
+            },
+            LevelInfo::init(database.clone(), 3, 0, opt.storage.clone()),
+            LevelInfo::init(database.clone(), 4, 0, opt.storage.clone()),
+        ];
+        let tsm_reader_cache = Arc::new(ShardedCache::with_capacity(16));
+        #[rustfmt::skip]
+        let version = Version::new(1, database, opt.storage.clone(), 1, levels, 3100, tsm_reader_cache.clone());
         let mut version_edits = Vec::new();
         let mut ve = VersionEdit::new(1);
         #[rustfmt::skip]
         ve.add_file(
             CompactMeta {
-                file_id: 4,
-                file_size: 100,
-                tsf_id: 1,
-                level: 1,
-                min_ts: 3051,
-                max_ts: 3150,
-                high_seq: 2,
-                low_seq: 2,
+                file_id: 4, file_size: 100, tsf_id: 1, level: 1,
+                min_ts: 3051, max_ts: 3150, high_seq: 2, low_seq: 2,
                 is_delta: false,
             },
             3100,
@@ -1060,7 +1384,6 @@ mod test {
     #[tokio::test]
     async fn test_version_apply_version_edits_2() {
         //! There is a Version with two levels:
-        //! - Lv.0: [ ]
         //! - Lv.1: [ (3, 3001~3000), (4, 3051~3150) ]
         //! - Lv.2: [ (1, 1~1000), (2, 1001~2000) ]
         //! - Lv.3: [ ]
@@ -1086,58 +1409,38 @@ mod test {
         let ts_family_id = 1;
         let tsm_dir = opt.storage.tsm_dir(&database, ts_family_id);
         #[rustfmt::skip]
-            let version = Version {
-            ts_family_id: 1,
-            database: database.clone(),
-            storage_opt: opt.storage.clone(),
-            last_seq: 1,
-            max_level_ts: 3150,
-            levels_info: [
-                LevelInfo::init(database.clone(), 0, 1, opt.storage.clone()),
-                LevelInfo {
-                    files: vec![
-                        Arc::new(ColumnFile::new(3, 1, TimeRange::new(3001, 3100), 100, false, make_tsm_file_name(&tsm_dir, 3))),
-                        Arc::new(ColumnFile::new(4, 1, TimeRange::new(3051, 3150), 100, false, make_tsm_file_name(&tsm_dir, 4))),
-                    ],
-                    database: database.clone(),
-                    tsf_id: 1,
-                    storage_opt: opt.storage.clone(),
-                    level: 1,
-                    cur_size: 100,
-                    max_size: 1000,
-                    time_range: TimeRange::new(3001, 3150),
-                },
-                LevelInfo {
-                    files: vec![
-                        Arc::new(ColumnFile::new(1, 2, TimeRange::new(1, 1000), 1000, false, make_tsm_file_name(&tsm_dir, 1))),
-                        Arc::new(ColumnFile::new(2, 2, TimeRange::new(1001, 2000), 1000, false, make_tsm_file_name(&tsm_dir, 2))),
-                    ],
-                    database: database.clone(),
-                    tsf_id: 1,
-                    storage_opt: opt.storage.clone(),
-                    level: 2,
-                    cur_size: 2000,
-                    max_size: 10000,
-                    time_range: TimeRange::new(1, 2000),
-                },
-                LevelInfo::init(database.clone(), 3, 1, opt.storage.clone()),
-                LevelInfo::init(database, 4, 1, opt.storage.clone()),
-            ],
-            tsm_reader_cache: Arc::new(ShardedCache::with_capacity(1)),
-        };
+        let levels = [
+            LevelInfo::init(database.clone(), 0, 1, opt.storage.clone()),
+            LevelInfo {
+                files: vec![
+                    Arc::new(ColumnFile::new(3, 1, TimeRange::new(3001, 3100), 100, false, make_tsm_file_name(&tsm_dir, 3))),
+                    Arc::new(ColumnFile::new(4, 1, TimeRange::new(3051, 3150), 100, false, make_tsm_file_name(&tsm_dir, 4))),
+                ],
+                database: database.clone(), tsf_id: 1, storage_opt: opt.storage.clone(), level: 1,
+                cur_size: 100, max_size: 1000, time_range: TimeRange::new(3001, 3150),
+            },
+            LevelInfo {
+                files: vec![
+                    Arc::new(ColumnFile::new(1, 2, TimeRange::new(1, 1000), 1000, false, make_tsm_file_name(&tsm_dir, 1))),
+                    Arc::new(ColumnFile::new(2, 2, TimeRange::new(1001, 2000), 1000, false, make_tsm_file_name(&tsm_dir, 2))),
+                ],
+                database: database.clone(), tsf_id: 1, storage_opt: opt.storage.clone(), level: 2,
+                cur_size: 2000, max_size: 10000, time_range: TimeRange::new(1, 2000),
+            },
+            LevelInfo::init(database.clone(), 3, 1, opt.storage.clone()),
+            LevelInfo::init(database.clone(), 4, 1, opt.storage.clone()),
+        ];
+        let tsm_reader_cache = Arc::new(ShardedCache::with_capacity(16));
+        #[rustfmt::skip]
+        let version = Version::new(1, database, opt.storage.clone(), 1, levels, 3150, tsm_reader_cache.clone());
+
         let mut version_edits = Vec::new();
         let mut ve = VersionEdit::new(1);
         #[rustfmt::skip]
         ve.add_file(
             CompactMeta {
-                file_id: 5,
-                file_size: 150,
-                tsf_id: 1,
-                level: 2,
-                min_ts: 3001,
-                max_ts: 3150,
-                high_seq: 2,
-                low_seq: 2,
+                file_id: 5, file_size: 150, tsf_id: 1, level: 2,
+                min_ts: 3001, max_ts: 3150, high_seq: 2, low_seq: 2,
                 is_delta: false,
             },
             3150,
@@ -1145,14 +1448,8 @@ mod test {
         #[rustfmt::skip]
         ve.add_file(
             CompactMeta {
-                file_id: 6,
-                file_size: 2000,
-                tsf_id: 1,
-                level: 3,
-                min_ts: 1,
-                max_ts: 2000,
-                high_seq: 2,
-                low_seq: 2,
+                file_id: 6, file_size: 2000, tsf_id: 1, level: 3,
+                min_ts: 1, max_ts: 2000, high_seq: 2, low_seq: 2,
                 is_delta: false,
             },
             3150,
@@ -1187,6 +1484,239 @@ mod test {
         assert_eq!(lvl.files.len(), 1);
         let col_file = lvl.files.last().unwrap();
         assert_eq!(col_file.time_range, TimeRange::new(1, 2000));
+    }
+
+    fn build_version_by_column_files(
+        storage_opt: Arc<StorageOptions>,
+        database: Arc<String>,
+        ts_family_id: TseriesFamilyId,
+        mut files: Vec<Arc<ColumnFile>>,
+    ) -> Version {
+        files.sort_by_key(|f| f.file_id);
+        let mut levels =
+            LevelInfo::init_levels(database.clone(), ts_family_id, storage_opt.clone());
+        let max_level_ts = i64::MIN;
+        for file in files {
+            let lv = &mut levels[file.level as usize];
+            lv.cur_size += file.size;
+            lv.time_range.merge(file.time_range());
+            lv.files.push(file);
+        }
+
+        let tsm_reader_cache = Arc::new(ShardedCache::with_capacity(16));
+        Version::new(
+            ts_family_id,
+            database,
+            storage_opt,
+            0,
+            levels,
+            max_level_ts,
+            tsm_reader_cache,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_super_version_count_file() {
+        let dir = "/tmp/test/ts_family/super_version_count_file";
+        let mut global_config = get_config("../config/config.toml");
+        global_config.storage.path = dir.to_string();
+
+        #[rustfmt::skip]
+        let data = vec![
+            HashMap::from([
+                (model_utils::unite_id(1, 0), vec![DataBlock::I64 { ts: vec![1, 2, 3, 4], val: vec![1, 1, 1, 1], enc: DataBlockEncoding::default() }]),
+                (model_utils::unite_id(2, 0), vec![DataBlock::I64 { ts: vec![1, 2, 3, 4], val: vec![1, 1, 1, 1], enc: DataBlockEncoding::default() }]),
+            ]),
+            HashMap::from([
+                (model_utils::unite_id(1, 0), vec![DataBlock::I64 { ts: vec![4, 5, 6], val: vec![1, 1, 1], enc: DataBlockEncoding::default() }]),
+                (model_utils::unite_id(2, 0), vec![DataBlock::I64 { ts: vec![4, 5, 6], val: vec![1, 1, 1], enc: DataBlockEncoding::default() }]),
+            ]),
+            HashMap::from([
+                (model_utils::unite_id(1, 0), vec![DataBlock::I64 { ts: vec![7, 8, 9], val: vec![1, 1, 1], enc: DataBlockEncoding::default() }]),
+                (model_utils::unite_id(2, 0), vec![DataBlock::I64 { ts: vec![7, 8, 9], val: vec![1, 1, 1], enc: DataBlockEncoding::default() }]),
+            ]),
+        ];
+
+        let opt = Arc::new(Options::from(&global_config));
+        let database = Arc::new("dba".to_string());
+        let ts_family_id = 1;
+        let dir = opt.storage.tsm_dir(&database, 1);
+
+        let (_, files) =
+            write_data_blocks_to_column_file(&dir, data, ts_family_id, opt.clone()).await;
+        let version =
+            build_version_by_column_files(opt.storage.clone(), database, ts_family_id, files);
+        let version = SuperVersion::new(
+            ts_family_id,
+            opt.storage.clone(),
+            CacheGroup {
+                mut_cache: Arc::new(RwLock::new(MemCache::new(ts_family_id, 1, 1))),
+                immut_cache: vec![],
+            },
+            Arc::new(version),
+            1,
+        );
+
+        #[rustfmt::skip]
+        let _skip_fmt = {
+            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(i64::MIN, i64::MAX).into()])).await.unwrap(), 9);
+            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(0, 0).into()])).await.unwrap(), 0);
+            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(1, 1).into()])).await.unwrap(), 1);
+            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(1, 4).into()])).await.unwrap(), 4);
+            assert_eq!(version.count_by_predicates(2, Arc::new(vec![(1, 4).into()])).await.unwrap(), 4);
+            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(1, 5).into()])).await.unwrap(), 5);
+            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(4, 4).into()])).await.unwrap(), 1);
+            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(4, 5).into()])).await.unwrap(), 2);
+            assert_eq!(version.count_by_predicates(2, Arc::new(vec![(4, 5).into()])).await.unwrap(), 2);
+            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(4, 7).into()])).await.unwrap(), 4);
+            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(10, 10).into()])).await.unwrap(), 0);
+
+            assert_eq!(version.count_by_predicates(1, Arc::new(
+                vec![(2, 3).into(), (5, 5).into(), (8, 8).into()]
+            )).await.unwrap(), 4);
+            assert_eq!(version.count_by_predicates(1, Arc::new(
+                vec![(4, 5).into(), (6, 8).into()]
+            )).await.unwrap(), 5);
+            assert_eq!(version.count_by_predicates(1, Arc::new(
+                vec![(1, 3).into(), (2, 4).into(), (3, 7).into()]
+            )).await.unwrap(), 7);
+            "skip_fmt"
+        };
+    }
+
+    #[tokio::test]
+    async fn test_super_version_count_memcache() {
+        let dir = "/tmp/test/ts_family/super_version_count_memcache";
+        let mut global_config = get_config("../config/config.toml");
+        global_config.storage.path = dir.to_string();
+
+        #[rustfmt::skip]
+        let cache_group = {
+            let mut caches = vec![MemCache::new(1, 16, 0), MemCache::new(1, 16, 0), MemCache::new(1, 16, 0)];
+            // cache, sid, schema_id, schema, time_range, put_none
+            put_rows_to_cache(&mut caches[0], 0, 1, default_with_field_id(vec![1, 2]), (1, 4), false);
+            put_rows_to_cache(&mut caches[1], 0, 1, default_with_field_id(vec![1, 2]), (4, 6), false);
+            put_rows_to_cache(&mut caches[2], 0, 1, default_with_field_id(vec![1, 2]), (7, 9), false);
+            let mut mut_cache = MemCache::new(1, 16, 0);
+            put_rows_to_cache(&mut mut_cache, 0, 1, default_with_field_id(vec![1, 2]), (11, 15), false);
+            CacheGroup {
+                mut_cache: Arc::new(RwLock::new(mut_cache)),
+                immut_cache: caches.into_iter().map(|c| Arc::new(RwLock::new(c))).collect(),
+            }
+        };
+
+        let opt = Arc::new(Options::from(&global_config));
+        let database = Arc::new("dba".to_string());
+        let ts_family_id = 1;
+
+        let version =
+            build_version_by_column_files(opt.storage.clone(), database, ts_family_id, vec![]);
+        let version = SuperVersion::new(
+            ts_family_id,
+            opt.storage.clone(),
+            cache_group,
+            Arc::new(version),
+            1,
+        );
+
+        #[rustfmt::skip]
+        let _skip_fmt = {
+            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(i64::MIN, i64::MAX).into()])).await.unwrap(), 14);
+            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(0, 0).into()])).await.unwrap(), 0);
+            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(1, 1).into()])).await.unwrap(), 1);
+            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(1, 4).into()])).await.unwrap(), 4);
+            assert_eq!(version.count_by_predicates(2, Arc::new(vec![(1, 4).into()])).await.unwrap(), 4);
+            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(1, 5).into()])).await.unwrap(), 5);
+            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(4, 4).into()])).await.unwrap(), 1);
+            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(4, 5).into()])).await.unwrap(), 2);
+            assert_eq!(version.count_by_predicates(2, Arc::new(vec![(4, 5).into()])).await.unwrap(), 2);
+            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(4, 7).into()])).await.unwrap(), 4);
+            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(10, 10).into()])).await.unwrap(), 0);
+
+            assert_eq!(version.count_by_predicates(1, Arc::new(
+                vec![(2, 3).into(), (5, 5).into(), (8, 8).into()]
+            )).await.unwrap(), 4);
+            assert_eq!(version.count_by_predicates(1, Arc::new(
+                vec![(4, 5).into(), (6, 8).into()]
+            )).await.unwrap(), 5);
+            assert_eq!(version.count_by_predicates(1, Arc::new(
+                vec![(1, 3).into(), (2, 4).into(), (3, 7).into()]
+            )).await.unwrap(), 7);
+            "skip_fmt"
+        };
+    }
+
+    #[tokio::test]
+    async fn test_super_version_count() {
+        let dir = "/tmp/test/ts_family/super_version_count";
+        let mut global_config = get_config("../config/config.toml");
+        global_config.storage.path = dir.to_string();
+
+        #[rustfmt::skip]
+        let data = vec![
+            HashMap::from([
+                (model_utils::unite_id(1, 0), vec![DataBlock::I64 { ts: vec![1, 2, 3, 4], val: vec![1, 1, 1, 1], enc: DataBlockEncoding::default() }]),
+                (model_utils::unite_id(2, 0), vec![DataBlock::I64 { ts: vec![1, 2, 3, 4], val: vec![1, 1, 1, 1], enc: DataBlockEncoding::default() }]),
+            ]),
+            HashMap::from([
+                (model_utils::unite_id(1, 0), vec![DataBlock::I64 { ts: vec![4, 5, 6], val: vec![1, 1, 1], enc: DataBlockEncoding::default() }]),
+                (model_utils::unite_id(2, 0), vec![DataBlock::I64 { ts: vec![4, 5, 6], val: vec![1, 1, 1], enc: DataBlockEncoding::default() }]),
+            ]),
+            HashMap::from([
+                (model_utils::unite_id(1, 0), vec![DataBlock::I64 { ts: vec![7, 8, 9], val: vec![1, 1, 1], enc: DataBlockEncoding::default() }]),
+                (model_utils::unite_id(2, 0), vec![DataBlock::I64 { ts: vec![7, 8, 9], val: vec![1, 1, 1], enc: DataBlockEncoding::default() }]),
+            ]),
+        ];
+
+        #[rustfmt::skip]
+        let cache_group = {
+            let mut caches = vec![MemCache::new(1, 16, 0), MemCache::new(1, 16, 0), MemCache::new(1, 16, 0)];
+            // cache, sid, schema_id, schema, time_range, put_none
+            put_rows_to_cache(&mut caches[0], 0, 1, default_with_field_id(vec![1, 2]), (11, 15), false);
+            put_rows_to_cache(&mut caches[1], 0, 1, default_with_field_id(vec![1, 2]), (21, 25), false);
+            put_rows_to_cache(&mut caches[2], 0, 1, default_with_field_id(vec![1, 2]), (31, 35), false);
+            let mut mut_cache = MemCache::new(1, 16, 0);
+            put_rows_to_cache(&mut mut_cache, 0, 1, default_with_field_id(vec![1, 2]), (31, 40), false);
+            CacheGroup {
+                mut_cache: Arc::new(RwLock::new(mut_cache)),
+                immut_cache: caches.into_iter().map(|c| Arc::new(RwLock::new(c))).collect(),
+            }
+        };
+
+        let opt = Arc::new(Options::from(&global_config));
+        let database = Arc::new("dba".to_string());
+        let ts_family_id = 1;
+        let dir = opt.storage.tsm_dir(&database, 1);
+
+        let (_, files) =
+            write_data_blocks_to_column_file(&dir, data, ts_family_id, opt.clone()).await;
+        let version =
+            build_version_by_column_files(opt.storage.clone(), database, ts_family_id, files);
+        let version = SuperVersion::new(
+            ts_family_id,
+            opt.storage.clone(),
+            cache_group,
+            Arc::new(version),
+            1,
+        );
+
+        #[rustfmt::skip]
+        let _skip_fmt = {
+            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(i64::MIN, i64::MAX).into()])).await.unwrap(), 29);
+            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(0, 0).into()])).await.unwrap(), 0);
+            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(1, 1).into()])).await.unwrap(), 1);
+            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(1, 10).into()])).await.unwrap(), 9);
+            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(1, 50).into()])).await.unwrap(), 29);
+            assert_eq!(version.count_by_predicates(2, Arc::new(vec![(5, 10).into()])).await.unwrap(), 5);
+            assert_eq!(version.count_by_predicates(2, Arc::new(vec![(5, 21).into()])).await.unwrap(), 11);
+            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(10, 20).into()])).await.unwrap(), 5);
+            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(10, 50).into()])).await.unwrap(), 20);
+            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(15, 21).into()])).await.unwrap(), 2);
+            assert_eq!(version.count_by_predicates(2, Arc::new(vec![(15, 25).into()])).await.unwrap(), 6);
+            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(40, 40).into()])).await.unwrap(), 1);
+            assert_eq!(version.count_by_predicates(1, Arc::new(vec![(41, 41).into()])).await.unwrap(), 0);
+            "skip_fmt"
+        };
     }
 
     #[tokio::test]
@@ -1241,10 +1771,11 @@ mod test {
         points.insert((0, 0), row_group);
         let _ = tsf.put_points(0, points);
 
-        assert_eq!(
-            tsf.mut_cache.read().get_data(0, |_| true, |_| true).len(),
-            1
-        );
+        let mut cached_data = vec![];
+        tsf.mut_cache
+            .read()
+            .read_field_data(0, |_| true, |_| true, |d| cached_data.push(d));
+        assert_eq!(cached_data.len(), 1);
         tsf.delete_series(
             &[0],
             &TimeRange {
@@ -1252,11 +1783,11 @@ mod test {
                 max_ts: 200,
             },
         );
-        assert!(tsf
-            .mut_cache
+        cached_data.clear();
+        tsf.mut_cache
             .read()
-            .get_data(0, |_| true, |_| true)
-            .is_empty());
+            .read_field_data(0, |_| true, |_| true, |d| cached_data.push(d));
+        assert!(cached_data.is_empty());
     }
 
     // Util function for testing with summary modification.

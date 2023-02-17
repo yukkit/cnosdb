@@ -276,8 +276,8 @@ impl SeriesData {
         column_id: ColumnId,
         mut time_predicate: impl FnMut(Timestamp) -> bool,
         mut value_predicate: impl FnMut(&FieldVal) -> bool,
-    ) -> Vec<DataType> {
-        let mut res = Vec::new();
+        mut handle_data: impl FnMut(DataType),
+    ) {
         for group in self.groups.iter() {
             let field_index = group.schema.fields_id();
             let index = match field_index.get(&column_id) {
@@ -291,12 +291,11 @@ impl SeriesData {
                 .for_each(|row| {
                     if let Some(Some(field)) = row.fields.get(*index) {
                         if value_predicate(field) {
-                            res.push(field.data_value(row.ts));
+                            handle_data(field.data_value(row.ts))
                         }
                     }
                 });
         }
-        res
     }
 
     pub fn flat_groups(&self) -> Vec<(SchemaId, Arc<TskvTableSchema>, &Vec<RowData>)> {
@@ -380,21 +379,44 @@ impl MemCache {
         Ok(())
     }
 
-    pub fn get_data(
+    pub fn read_field_data(
         &self,
         field_id: FieldId,
         time_predicate: impl FnMut(Timestamp) -> bool,
         value_predicate: impl FnMut(&FieldVal) -> bool,
-    ) -> Vec<DataType> {
+        handle_data: impl FnMut(DataType),
+    ) {
         let (field_id, sid) = split_id(field_id);
         let index = (sid as usize) % self.part_count;
         let part = self.partions[index].read();
 
         match part.get(&sid) {
-            Some(series) => series
-                .read()
-                .read_data(field_id, time_predicate, value_predicate),
-            None => Vec::new(),
+            Some(series) => {
+                series
+                    .read()
+                    .read_data(field_id, time_predicate, value_predicate, handle_data)
+            }
+            None => {}
+        }
+    }
+
+    pub fn read_column_data(
+        &self,
+        column_id: ColumnId,
+        mut time_predicate: impl FnMut(Timestamp) -> bool,
+        mut value_predicate: impl FnMut(&FieldVal) -> bool,
+        mut handle_data: impl FnMut(DataType),
+    ) {
+        for part in self.partions.iter() {
+            let part = part.read();
+            for (_, series) in part.iter() {
+                series.read().read_data(
+                    column_id,
+                    &mut time_predicate,
+                    &mut value_predicate,
+                    &mut handle_data,
+                );
+            }
         }
     }
 
@@ -573,7 +595,7 @@ pub(crate) mod test {
     ) {
         let mut rows = Vec::new();
         let mut size: usize = schema.size();
-        for ts in time_range.0..time_range.1 + 1 {
+        for ts in time_range.0..=time_range.1 {
             let mut fields = Vec::new();
             for _ in 0..schema.columns().len() {
                 size += size_of::<Option<FieldVal>>();

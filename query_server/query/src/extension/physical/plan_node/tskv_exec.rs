@@ -228,6 +228,7 @@ impl TableScanStream {
             batch_size,
             table_schema.tenant.clone(),
             filter,
+            None,
             proj_schema.clone(),
             proj_table_schema,
             metrics.tskv_metrics(),
