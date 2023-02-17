@@ -244,6 +244,22 @@ impl TableScanStream {
             metrics,
         })
     }
+
+    pub fn with_iterator(
+        proj_schema: SchemaRef,
+        batch_size: usize,
+        coord: CoordinatorRef,
+        iterator: ReaderIterator,
+        metrics: TableScanMetrics,
+    ) -> Self {
+        Self {
+            proj_schema,
+            batch_size,
+            coord,
+            iterator,
+            metrics,
+        }
+    }
 }
 
 impl Stream for TableScanStream {
