@@ -13,6 +13,7 @@ pub use wal::print_wal_statistics;
 
 pub mod byte_utils;
 mod compaction;
+mod compute;
 mod context;
 pub mod database;
 pub mod engine;

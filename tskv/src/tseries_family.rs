@@ -1,29 +1,25 @@
-use std::borrow::{Borrow, BorrowMut};
+use std::borrow::Borrow;
 use std::cmp::{self, max, min};
 use std::collections::{HashMap, HashSet};
-use std::ops::{Bound, Deref, DerefMut};
+use std::fmt::{write, Display};
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use config::get_config;
-use datafusion::sql::sqlparser::keywords::MIN;
 use lazy_static::lazy_static;
 use lru_cache::ShardedCache;
 use memory_pool::MemoryPoolRef;
 use models::schema::TableColumn;
-use models::{
-    utils as model_utils, ColumnId, FieldId, InMemPoint, SchemaId, SeriesId, Timestamp, ValueType,
-};
+use models::{FieldId, SchemaId, SeriesId, Timestamp};
 use parking_lot::{Mutex, RwLock};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::watch::Receiver;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-use trace::{debug, error, info, trace, warn};
+use trace::{debug, error, info, warn};
 use utils::BloomFilter;
 
 use crate::compaction::{CompactReq, CompactTask, FlushReq, LevelCompactionPicker, Picker};
@@ -33,10 +29,7 @@ use crate::file_utils::{self, make_delta_file_name, make_tsm_file_name};
 use crate::kv_option::{CacheOptions, Options, StorageOptions};
 use crate::memcache::{DataType, FieldVal, MemCache, RowGroup};
 use crate::summary::{CompactMeta, VersionEdit};
-use crate::tsm::{
-    BlockMeta, BlockMetaIterator, ColumnReader, DataBlock, Index, IndexReader, TsmReader,
-    TsmTombstone,
-};
+use crate::tsm::{DataBlock, TsmReader, TsmTombstone};
 use crate::{ColumnFileId, LevelId, TseriesFamilyId};
 
 lazy_static! {
@@ -134,14 +127,20 @@ impl Ord for TimeRange {
     }
 }
 
+impl Display for TimeRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "({}, {})", self.min_ts, self.max_ts)
+    }
+}
+
 #[derive(PartialEq, Eq)]
 pub enum TimeRangeCmp {
     /// A has no intersection with B
-    NoIntersection,
+    Exclude,
     /// A includes B
     Include,
     /// A overlaps with B
-    Overlap,
+    Intersect,
 }
 
 #[derive(Debug)]
@@ -643,297 +642,30 @@ impl SuperVersion {
         }
     }
 
-    pub async fn count_by_predicates(
-        &self,
-        series_ids: &[SeriesId],
-        column_id: ColumnId,
-        sorted_time_ranges: Arc<Vec<TimeRange>>,
-    ) -> Result<u64> {
-        trace!("Selecting count for column: {}", column_id);
+    pub fn column_files(&self, time_ranges: &[TimeRange]) -> Vec<Arc<ColumnFile>> {
+        let mut files = Vec::new();
 
-        for series_id in series_ids {}
-
-        struct ReadTask {
-            tsm_reader: Arc<TsmReader>,
-            block_meta: Arc<BlockMeta>,
-            time_range: TimeRange,
-            included: bool,
-        }
-
-        fn collect_column_files(
-            super_version: &SuperVersion,
-            sorted_time_ranges: &[TimeRange],
-        ) -> Vec<Arc<ColumnFile>> {
-            let mut files = Vec::new();
-
-            for lv in super_version.version.levels_info.iter() {
-                let mut overlaped = false;
-                for tr in sorted_time_ranges {
-                    if lv.time_range.overlaps(tr) {
-                        overlaped = true;
+        for lv in self.version.levels_info.iter() {
+            let mut overlapped = false;
+            for tr in time_ranges {
+                if lv.time_range.overlaps(tr) {
+                    overlapped = true;
+                    break;
+                }
+            }
+            if !overlapped {
+                continue;
+            }
+            for cf in lv.files.iter() {
+                for tr in time_ranges {
+                    if cf.time_range.overlaps(tr) {
+                        files.push(cf.clone());
                         break;
                     }
                 }
-                if !overlaped {
-                    continue;
-                }
-                for cf in lv.files.iter() {
-                    for tr in sorted_time_ranges {
-                        if cf.time_range.overlaps(tr) {
-                            files.push(cf.clone());
-                            break;
-                        }
-                    }
-                }
             }
-            files
         }
-
-        async fn collect_field_read_tasks(
-            super_version: &SuperVersion,
-            files: &[Arc<ColumnFile>],
-            field_id: FieldId,
-            sorted_time_ranges: &[TimeRange],
-        ) -> Result<Vec<ReadTask>> {
-            let mut read_tasks: Vec<ReadTask> = Vec::new();
-
-            for cf in files {
-                let path = cf.file_path();
-                let reader = super_version.version.get_tsm_reader(&path).await?;
-                for idx in reader.index_iterator_opt(field_id) {
-                    for blk_meta in idx.block_iterator() {
-                        let blk_tr = (blk_meta.min_ts(), blk_meta.max_ts()).into();
-                        let mut tr_cmp = TimeRangeCmp::NoIntersection;
-                        for tr in sorted_time_ranges.iter() {
-                            if tr.includes(&blk_tr) {
-                                // Block is included by conditions, needn't to decode.
-                                tr_cmp = TimeRangeCmp::Include;
-                                break;
-                            } else if tr.overlaps(&blk_tr) {
-                                tr_cmp = TimeRangeCmp::Overlap;
-                            }
-                        }
-                        if tr_cmp != TimeRangeCmp::NoIntersection {
-                            read_tasks.push(ReadTask {
-                                tsm_reader: reader.clone(),
-                                block_meta: Arc::new(blk_meta),
-                                time_range: blk_tr,
-                                included: tr_cmp == TimeRangeCmp::Include,
-                            });
-                        }
-                    }
-                }
-            }
-
-            read_tasks.sort_by(|a, b| a.time_range.cmp(&b.time_range).reverse());
-            Ok(read_tasks)
-        }
-
-        fn count_field_in_caches(
-            super_version: &SuperVersion,
-            field_id: FieldId,
-            sorted_time_ranges: &[TimeRange],
-        ) -> (u64, HashSet<i64>, TimeRange) {
-            let time_predicate = |ts| {
-                sorted_time_ranges
-                    .iter()
-                    .any(|tr| tr.is_boundless() || tr.contains(ts))
-            };
-            let mut cached_timestamps: HashSet<i64> = HashSet::new();
-            let mut cached_time_range = TimeRange::new(i64::MAX, i64::MIN);
-            super_version.caches.read_field_data(
-                field_id,
-                time_predicate,
-                |_| true,
-                |d| {
-                    let ts = d.timestamp();
-                    cached_time_range.min_ts = cached_time_range.min_ts.min(ts);
-                    cached_time_range.max_ts = cached_time_range.max_ts.max(ts);
-                    cached_timestamps.insert(ts);
-                },
-            );
-
-            (
-                cached_timestamps.len() as u64,
-                cached_timestamps,
-                cached_time_range,
-            )
-        }
-
-        async fn count_field_in_files(
-            reader_blk_metas: Vec<ReadTask>,
-            count: Arc<AtomicU64>,
-            time_ranges: Arc<Vec<TimeRange>>,
-            cached_timestamps: Arc<HashSet<Timestamp>>,
-            cached_time_range: Arc<TimeRange>,
-        ) -> Result<()> {
-            let mut jh_vec = Vec::with_capacity(reader_blk_metas.len());
-            for read_task in reader_blk_metas {
-                // let tsm_reader = read_task.tsm_reader.clone();
-                // let block_meta = read_task.block_meta.clone();
-                let jh = tokio::spawn(async move {
-                    read_task
-                        .tsm_reader
-                        .get_data_block(&read_task.block_meta)
-                        .await
-                });
-                jh_vec.push(jh);
-            }
-            let mut ts_set: HashSet<Timestamp> = HashSet::new();
-            for jh in jh_vec {
-                let blk = jh.await.unwrap();
-                let blk = blk.unwrap();
-                if let Some(tr) = blk.time_range() {
-                    let tr: TimeRange = tr.into();
-                    let timestamps = blk.ts();
-                    if cached_time_range.overlaps(&tr) {
-                        // Time range of this DataBlock overlaps with cached timestamps,
-                        // need to find the difference and add to count directly.
-                        let mut c = 0_u64;
-                        for ts in timestamps {
-                            if !cached_timestamps.contains(ts) {
-                                c += 1;
-                            }
-                        }
-                        count.fetch_add(c, Ordering::SeqCst);
-                    } else {
-                        // Cached timestmaps not contains this DataBlock.
-                        for tr in time_ranges.iter() {
-                            let low = match timestamps.binary_search(&tr.min_ts) {
-                                Ok(l) => l,
-                                Err(l) => {
-                                    if l == 0 {
-                                        // Lowest timestamp is smaller than the first timestamp.
-                                        0
-                                    } else if l < timestamps.len() {
-                                        if timestamps[l] >= tr.min_ts {
-                                            l
-                                        } else {
-                                            l + 1
-                                        }
-                                    } else {
-                                        // Lowest timestamp is greater than the last timestamp.
-                                        break;
-                                    }
-                                }
-                            };
-                            let high = match timestamps.binary_search(&tr.max_ts) {
-                                Ok(h) => h,
-                                Err(h) => {
-                                    if h == 0 {
-                                        // Highest timestamp is smaller than the first timestamp.
-                                        continue;
-                                    } else if h < timestamps.len() {
-                                        if timestamps[h] <= tr.max_ts {
-                                            h - 1
-                                        } else {
-                                            h
-                                        }
-                                    } else {
-                                        // Highest timestamp is greater than the last timestamp.
-                                        timestamps.len() - 1
-                                    }
-                                }
-                            };
-                            ts_set.extend(timestamps[low..=high].iter());
-                        }
-                    }
-                } else {
-                    // DataBlock is empty.
-                    continue;
-                }
-            }
-            count.fetch_add(ts_set.len() as u64, Ordering::SeqCst);
-
-            Ok(())
-        }
-
-        let column_files = collect_column_files(self, &sorted_time_ranges);
-        let mut count_sum = 0_u64;
-        for series_id in series_ids {
-            let field_id = model_utils::unite_id(column_id, *series_id);
-
-            let reader_blk_meta_trs =
-                collect_field_read_tasks(self, &column_files, field_id, &sorted_time_ranges)
-                    .await?;
-
-            let (count, cached_timestamps, cached_time_range) =
-                count_field_in_caches(self, field_id, &sorted_time_ranges);
-            let count = Arc::new(AtomicU64::new(count));
-            let cached_timestamps = Arc::new(cached_timestamps);
-            let cached_time_range = Arc::new(cached_time_range);
-
-            let mut jh_vec = Vec::new();
-
-            trace!("Printing selected fiels and blocks:");
-            let mut grouped_tr = TimeRange::new(i64::MAX, i64::MIN);
-            let mut grouped_reader_blk_metas: Vec<ReadTask> = Vec::new();
-            for read_task in reader_blk_meta_trs {
-                if grouped_reader_blk_metas.is_empty() || grouped_tr.overlaps(&read_task.time_range)
-                {
-                    // There is no grouped blocks to decode, or still grouping blocks.
-                    grouped_tr.merge(&read_task.time_range);
-                } else {
-                    grouped_tr = read_task.time_range;
-                    if grouped_reader_blk_metas.len() == 1 {
-                        // Only 1 grouped block, maybe no need to decode it.
-                        let reader_blk_metas = std::mem::take(&mut grouped_reader_blk_metas);
-                        let b = reader_blk_metas.first().unwrap();
-                        if cached_time_range.overlaps(&b.block_meta.time_range()) || !b.included {
-                            // Block overlaps with cached data or conditions, need to decode it to remove duplicates.
-                            let jh = tokio::spawn(count_field_in_files(
-                                reader_blk_metas,
-                                count.clone(),
-                                sorted_time_ranges.clone(),
-                                cached_timestamps.clone(),
-                                cached_time_range.clone(),
-                            ));
-                            jh_vec.push(jh);
-                        } else {
-                            count.fetch_add(b.block_meta.count() as u64, Ordering::SeqCst);
-                        }
-                    } else {
-                        // There are grouped blocks which have overlaped time range, need to decode them.
-                        let reader_blk_metas = std::mem::take(&mut grouped_reader_blk_metas);
-                        let jh = tokio::spawn(count_field_in_files(
-                            reader_blk_metas,
-                            count.clone(),
-                            sorted_time_ranges.clone(),
-                            cached_timestamps.clone(),
-                            cached_time_range.clone(),
-                        ));
-                        jh_vec.push(jh);
-                    }
-                }
-                grouped_reader_blk_metas.push(read_task);
-            }
-            if !grouped_reader_blk_metas.is_empty() {
-                let jh = tokio::spawn(count_field_in_files(
-                    grouped_reader_blk_metas,
-                    count.clone(),
-                    sorted_time_ranges.clone(),
-                    cached_timestamps.clone(),
-                    cached_time_range.clone(),
-                ));
-                jh_vec.push(jh);
-            }
-
-            for jh in jh_vec {
-                match jh.await {
-                    Ok(Ok(_)) => continue,
-                    Ok(Err(e)) => return Err(e),
-                    Err(e) => {
-                        return Err(Error::CommonError {
-                            reason: "Failed to get block for counting".to_string(),
-                        })
-                    }
-                }
-            }
-
-            count_sum += count.load(Ordering::Relaxed);
-        }
-
-        Ok(count_sum)
+        files
     }
 }
 
@@ -1259,7 +991,7 @@ impl Drop for TseriesFamily {
 }
 
 #[cfg(test)]
-mod test {
+pub mod test_tseries_family {
     use std::collections::{hash_map, HashMap};
     use std::mem::{size_of, size_of_val};
     use std::path::PathBuf;
@@ -1272,7 +1004,7 @@ mod test {
     use meta::meta_manager::RemoteMetaManager;
     use meta::MetaRef;
     use models::schema::{DatabaseSchema, TenantOptions};
-    use models::{utils as model_utils, Timestamp, ValueType};
+    use models::{utils as model_utils, Timestamp};
     use parking_lot::{Mutex, RwLock};
     use tokio::sync::mpsc::{self, Receiver};
     use tokio::sync::RwLock as AsyncRwLock;
@@ -1486,7 +1218,7 @@ mod test {
         assert_eq!(col_file.time_range, TimeRange::new(1, 2000));
     }
 
-    fn build_version_by_column_files(
+    pub(crate) fn build_version_by_column_files(
         storage_opt: Arc<StorageOptions>,
         database: Arc<String>,
         ts_family_id: TseriesFamilyId,
@@ -1513,235 +1245,6 @@ mod test {
             max_level_ts,
             tsm_reader_cache,
         )
-    }
-
-    #[tokio::test]
-    async fn test_super_version_count_file() {
-        let dir = "/tmp/test/ts_family/super_version_count_file";
-        let mut global_config = get_config("../config/config.toml");
-        global_config.storage.path = dir.to_string();
-
-        #[rustfmt::skip]
-        let data = vec![
-            HashMap::from([
-                (model_utils::unite_id(1, 1), vec![DataBlock::I64 { ts: vec![1, 2, 3, 4], val: vec![1, 1, 1, 1], enc: DataBlockEncoding::default() }]),
-                (model_utils::unite_id(1, 2), vec![DataBlock::I64 { ts: vec![10, 20, 30, 40], val: vec![1, 1, 1, 1], enc: DataBlockEncoding::default() }]),
-            ]),
-            HashMap::from([
-                (model_utils::unite_id(1, 1), vec![DataBlock::I64 { ts: vec![4, 5, 6], val: vec![1, 1, 1], enc: DataBlockEncoding::default() }]),
-                (model_utils::unite_id(1, 2), vec![DataBlock::I64 { ts: vec![40, 50, 60], val: vec![1, 1, 1], enc: DataBlockEncoding::default() }]),
-            ]),
-            HashMap::from([
-                (model_utils::unite_id(1, 1), vec![DataBlock::I64 { ts: vec![7, 8, 9], val: vec![1, 1, 1], enc: DataBlockEncoding::default() }]),
-                (model_utils::unite_id(1, 2), vec![DataBlock::I64 { ts: vec![70, 80, 90], val: vec![1, 1, 1], enc: DataBlockEncoding::default() }]),
-            ]),
-        ];
-
-        let opt = Arc::new(Options::from(&global_config));
-        let database = Arc::new("dba".to_string());
-        let ts_family_id = 1;
-        let dir = opt.storage.tsm_dir(&database, 1);
-
-        let (_, files) =
-            write_data_blocks_to_column_file(&dir, data, ts_family_id, opt.clone()).await;
-        let version =
-            build_version_by_column_files(opt.storage.clone(), database, ts_family_id, files);
-        let version = SuperVersion::new(
-            ts_family_id,
-            opt.storage.clone(),
-            CacheGroup {
-                mut_cache: Arc::new(RwLock::new(MemCache::new(ts_family_id, 1, 1))),
-                immut_cache: vec![],
-            },
-            Arc::new(version),
-            1,
-        );
-
-        #[rustfmt::skip]
-        let _skip_fmt = {
-            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(i64::MIN, i64::MAX).into()])).await.unwrap(), 9);
-            assert_eq!(version.count_by_predicates(&[1, 2], 1, Arc::new(vec![(i64::MIN, i64::MAX).into()])).await.unwrap(), 18);
-
-            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(0, 0).into()])).await.unwrap(), 0);
-            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(1, 1).into()])).await.unwrap(), 1);
-            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(1, 4).into()])).await.unwrap(), 4);
-            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(1, 5).into()])).await.unwrap(), 5);
-            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(4, 4).into()])).await.unwrap(), 1);
-            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(4, 5).into()])).await.unwrap(), 2);
-            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(4, 7).into()])).await.unwrap(), 4);
-            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(10, 10).into()])).await.unwrap(), 0);
-
-            assert_eq!(version.count_by_predicates(&[2], 1, Arc::new(vec![(10, 40).into()])).await.unwrap(), 4);
-            assert_eq!(version.count_by_predicates(&[2], 1, Arc::new(vec![(40, 50).into()])).await.unwrap(), 2);
-
-            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(
-                vec![(2, 3).into(), (5, 5).into(), (8, 8).into()]
-            )).await.unwrap(), 4);
-            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(
-                vec![(4, 5).into(), (6, 8).into()]
-            )).await.unwrap(), 5);
-            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(
-                vec![(1, 3).into(), (2, 4).into(), (3, 7).into()]
-            )).await.unwrap(), 7);
-
-            assert_eq!(version.count_by_predicates(&[1, 2], 1, Arc::new(
-                vec![(1, 3).into(), (2, 4).into(), (3, 7).into(),
-                     (10, 30).into(), (20, 40).into(), (30, 70).into()]
-            )).await.unwrap(), 14);
-            "skip_fmt"
-        };
-    }
-
-    #[tokio::test]
-    async fn test_super_version_count_memcache() {
-        let dir = "/tmp/test/ts_family/super_version_count_memcache";
-        let mut global_config = get_config("../config/config.toml");
-        global_config.storage.path = dir.to_string();
-
-        #[rustfmt::skip]
-        let cache_group = {
-            let mut caches = vec![MemCache::new(1, 16, 0), MemCache::new(1, 16, 0), MemCache::new(1, 16, 0)];
-            // cache, sid, schema_id, schema, time_range, put_none
-            put_rows_to_cache(&mut caches[0], 1, 1, default_table_schema(vec![1]), (1, 4), false);
-            put_rows_to_cache(&mut caches[0], 2, 1, default_table_schema(vec![1]), (101, 104), false);
-            put_rows_to_cache(&mut caches[1], 1, 1, default_table_schema(vec![1]), (4, 6), false);
-            put_rows_to_cache(&mut caches[1], 2, 1, default_table_schema(vec![1]), (104, 106), false);
-            put_rows_to_cache(&mut caches[2], 1, 1, default_table_schema(vec![1]), (7, 9), false);
-            put_rows_to_cache(&mut caches[2], 2, 1, default_table_schema(vec![1]), (107, 109), false);
-            let mut mut_cache = MemCache::new(1, 16, 0);
-            put_rows_to_cache(&mut mut_cache, 1, 1, default_table_schema(vec![1]), (11, 15), false);
-            put_rows_to_cache(&mut mut_cache, 2, 1, default_table_schema(vec![1]), (111, 115), false);
-            CacheGroup {
-                mut_cache: Arc::new(RwLock::new(mut_cache)),
-                immut_cache: caches.into_iter().map(|c| Arc::new(RwLock::new(c))).collect(),
-            }
-        };
-
-        let opt = Arc::new(Options::from(&global_config));
-        let database = Arc::new("dba".to_string());
-        let ts_family_id = 1;
-
-        let version =
-            build_version_by_column_files(opt.storage.clone(), database, ts_family_id, vec![]);
-        let version = SuperVersion::new(
-            ts_family_id,
-            opt.storage.clone(),
-            cache_group,
-            Arc::new(version),
-            1,
-        );
-
-        #[rustfmt::skip]
-        let _skip_fmt = {
-            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(i64::MIN, i64::MAX).into()])).await.unwrap(), 14);
-            assert_eq!(version.count_by_predicates(&[1, 2], 1, Arc::new(vec![(i64::MIN, i64::MAX).into()])).await.unwrap(), 28);
-            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(0, 0).into()])).await.unwrap(), 0);
-            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(1, 1).into()])).await.unwrap(), 1);
-            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(1, 4).into()])).await.unwrap(), 4);
-            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(1, 5).into()])).await.unwrap(), 5);
-            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(4, 4).into()])).await.unwrap(), 1);
-            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(4, 5).into()])).await.unwrap(), 2);
-            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(4, 7).into()])).await.unwrap(), 4);
-            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(10, 10).into()])).await.unwrap(), 0);
-
-            assert_eq!(version.count_by_predicates(&[2], 1, Arc::new(vec![(101, 104).into()])).await.unwrap(), 4);
-            assert_eq!(version.count_by_predicates(&[2], 1, Arc::new(vec![(104, 105).into()])).await.unwrap(), 2);
-
-            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(
-                vec![(2, 3).into(), (5, 5).into(), (8, 8).into()]
-            )).await.unwrap(), 4);
-            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(
-                vec![(4, 5).into(), (6, 8).into()]
-            )).await.unwrap(), 5);
-            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(
-                vec![(1, 3).into(), (2, 4).into(), (3, 7).into()]
-            )).await.unwrap(), 7);
-
-            assert_eq!(version.count_by_predicates(&[1, 2], 1, Arc::new(
-                vec![(1, 3).into(), (2, 4).into(), (3, 7).into(),
-                     (101, 103).into(), (102, 104).into(), (103, 107).into()]
-            )).await.unwrap(), 14);
-            "skip_fmt"
-        };
-    }
-
-    #[tokio::test]
-    async fn test_super_version_count() {
-        let dir = "/tmp/test/ts_family/super_version_count";
-        let mut global_config = get_config("../config/config.toml");
-        global_config.storage.path = dir.to_string();
-
-        #[rustfmt::skip]
-        let data = vec![
-            HashMap::from([
-                (model_utils::unite_id(1, 1), vec![DataBlock::I64 { ts: vec![1, 2, 3, 4], val: vec![1, 1, 1, 1], enc: DataBlockEncoding::default() }]),
-                (model_utils::unite_id(1, 2), vec![DataBlock::I64 { ts: vec![101, 102, 103, 104], val: vec![1, 1, 1, 1], enc: DataBlockEncoding::default() }]),
-            ]),
-            HashMap::from([
-                (model_utils::unite_id(1, 1), vec![DataBlock::I64 { ts: vec![4, 5, 6], val: vec![1, 1, 1], enc: DataBlockEncoding::default() }]),
-                (model_utils::unite_id(1, 2), vec![DataBlock::I64 { ts: vec![104, 105, 106], val: vec![1, 1, 1], enc: DataBlockEncoding::default() }]),
-            ]),
-            HashMap::from([
-                (model_utils::unite_id(1, 1), vec![DataBlock::I64 { ts: vec![7, 8, 9], val: vec![1, 1, 1], enc: DataBlockEncoding::default() }]),
-                (model_utils::unite_id(1, 2), vec![DataBlock::I64 { ts: vec![107, 108, 109], val: vec![1, 1, 1], enc: DataBlockEncoding::default() }]),
-            ]),
-        ];
-
-        #[rustfmt::skip]
-        let cache_group = {
-            let mut caches = vec![MemCache::new(1, 16, 0), MemCache::new(1, 16, 0), MemCache::new(1, 16, 0)];
-            // cache, sid, schema_id, schema, time_range, put_none
-            put_rows_to_cache(&mut caches[0], 1, 1, default_table_schema(vec![1]), (11, 15), false);
-            put_rows_to_cache(&mut caches[0], 2, 1, default_table_schema(vec![1]), (111, 115), false);
-            put_rows_to_cache(&mut caches[1], 1, 1, default_table_schema(vec![1]), (21, 25), false);
-            put_rows_to_cache(&mut caches[1], 2, 1, default_table_schema(vec![1]), (121, 125), false);
-            put_rows_to_cache(&mut caches[2], 1, 1, default_table_schema(vec![1]), (31, 35), false);
-            put_rows_to_cache(&mut caches[2], 2, 1, default_table_schema(vec![1]), (131, 135), false);
-            let mut mut_cache = MemCache::new(1, 16, 0);
-            put_rows_to_cache(&mut mut_cache, 1, 1, default_table_schema(vec![1]), (31, 40), false);
-            put_rows_to_cache(&mut mut_cache, 2, 1, default_table_schema(vec![1]), (131, 140), false);
-            CacheGroup {
-                mut_cache: Arc::new(RwLock::new(mut_cache)),
-                immut_cache: caches.into_iter().map(|c| Arc::new(RwLock::new(c))).collect(),
-            }
-        };
-
-        let opt = Arc::new(Options::from(&global_config));
-        let database = Arc::new("dba".to_string());
-        let ts_family_id = 1;
-        let dir = opt.storage.tsm_dir(&database, 1);
-
-        let (_, files) =
-            write_data_blocks_to_column_file(&dir, data, ts_family_id, opt.clone()).await;
-        let version =
-            build_version_by_column_files(opt.storage.clone(), database, ts_family_id, files);
-        let version = SuperVersion::new(
-            ts_family_id,
-            opt.storage.clone(),
-            cache_group,
-            Arc::new(version),
-            1,
-        );
-
-        #[rustfmt::skip]
-        let _skip_fmt = {
-            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(i64::MIN, i64::MAX).into()])).await.unwrap(), 29);
-            assert_eq!(version.count_by_predicates(&[1, 2], 1, Arc::new(vec![(i64::MIN, i64::MAX).into()])).await.unwrap(), 58);
-            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(0, 0).into()])).await.unwrap(), 0);
-            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(1, 1).into()])).await.unwrap(), 1);
-            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(1, 10).into()])).await.unwrap(), 9);
-            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(1, 50).into()])).await.unwrap(), 29);
-            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(10, 20).into()])).await.unwrap(), 5);
-            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(10, 50).into()])).await.unwrap(), 20);
-            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(15, 21).into()])).await.unwrap(), 2);
-            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(40, 40).into()])).await.unwrap(), 1);
-            assert_eq!(version.count_by_predicates(&[1], 1, Arc::new(vec![(41, 41).into()])).await.unwrap(), 0);
-
-            assert_eq!(version.count_by_predicates(&[2], 1, Arc::new(vec![(105, 110).into()])).await.unwrap(), 5);
-            assert_eq!(version.count_by_predicates(&[2], 1, Arc::new(vec![(105, 121).into()])).await.unwrap(), 11);
-            assert_eq!(version.count_by_predicates(&[2], 1, Arc::new(vec![(115, 125).into()])).await.unwrap(), 6);
-            "skip_fmt"
-        };
     }
 
     #[tokio::test]

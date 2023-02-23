@@ -76,7 +76,7 @@ impl ExecutionPlan for AggregateFilterTskvExec {
     fn execute(
         &self,
         partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let mut agg_columns = Vec::with_capacity(self.pushed_aggs.len());
         for agg in self.pushed_aggs.iter() {
@@ -89,7 +89,7 @@ impl ExecutionPlan for AggregateFilterTskvExec {
             }
         }
         let metrics = ExecutionPlanMetricsSet::new();
-        let metrics = TableScanMetrics::new(&metrics, partition);
+        let metrics = TableScanMetrics::new(&metrics, partition, Some(context.memory_pool()));
         let query_opt = QueryOption::new(
             100_usize,
             self.table_schema.tenant.clone(),

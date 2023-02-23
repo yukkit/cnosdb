@@ -32,6 +32,7 @@ use super::memcache::DataType;
 use super::tseries_family::{ColumnFile, SuperVersion, TimeRange};
 use super::tsm::{BlockMetaIterator, DataBlock, TsmReader};
 use super::{error, ColumnFileId, Error};
+use crate::compute::count::count_column_non_null_values;
 use crate::schema::error::SchemaError;
 use crate::tseries_family::Version;
 
@@ -890,9 +891,13 @@ impl RowIterator {
                     ColumnType::Field(vtype) => match vtype {
                         ValueType::Unknown => todo!(),
                         _ => {
-                            let agg_ret = version
-                                .count_by_predicates(&self.series, item.id, time_ranges.clone())
-                                .await?;
+                            let agg_ret = count_column_non_null_values(
+                                version.clone(),
+                                &self.series,
+                                item.id,
+                                time_ranges.clone(),
+                            )
+                            .await?;
                             let field_builder = builder[i]
                                 .as_any_mut()
                                 .downcast_mut::<Int64Builder>()
