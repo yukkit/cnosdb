@@ -180,11 +180,7 @@ impl<'a> Deserialize<'a> for Marker {
     where
         D: serde::Deserializer<'a>,
     {
-        let mark = deserializer.deserialize_struct(
-            "ValueEntry",
-            &["data_type", "value", "bound"],
-            MarkerVisitor,
-        )?;
+        let mark = MarkerSerialize::deserialize(deserializer)?;
 
         Ok(mark.into())
     }
@@ -1312,5 +1308,22 @@ mod tests {
                 panic!("excepted Domain::Equtable")
             }
         };
+    }
+
+    #[test]
+    fn test() {
+        let marker = Marker {
+            data_type: DataType::Boolean,
+            value: Some(ScalarValue::Boolean(None)),
+            bound: Bound::Above,
+        };
+
+        let bytes = serde_json::to_vec(&marker).unwrap();
+        let result = serde_json::from_slice::<Marker>(&bytes).unwrap();
+        assert_eq!(marker, result);
+
+        let bytes = bincode::serialize(&marker).unwrap();
+        let result = bincode::deserialize::<Marker>(&bytes).unwrap();
+        assert_eq!(marker, result);
     }
 }
