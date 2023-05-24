@@ -1,18 +1,19 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::ops::Not;
 use std::sync::Arc;
 use std::time::Duration;
+use std::vec;
 
 use config::{Config, HintedOffConfig};
-use datafusion::arrow::record_batch::RecordBatch;
 use meta::model::{MetaClientRef, MetaRef};
 use metrics::count::U64Counter;
 use metrics::label::Labels;
 use metrics::metric::Metric;
 use metrics::metric_register::MetricsRegister;
 use models::consistency_level::ConsistencyLevel;
-use models::meta_data::{ExpiredBucketInfo, VnodeAllInfo};
+use models::meta_data::{ExpiredBucketInfo, ReplicationSet, VnodeAllInfo, VnodeInfo};
+use models::object_reference::ResolvedTable;
+use models::predicate::domain::{ResolvedPredicateRef, TimeRanges};
 use models::schema::{Precision, DEFAULT_CATALOG};
 use protos::get_db_from_fb_points;
 use protos::kv_service::admin_command_request::Command::*;
@@ -20,24 +21,29 @@ use protos::kv_service::tskv_service_client::TskvServiceClient;
 use protos::kv_service::{WritePointsRequest, *};
 use protos::models::Points;
 use tokio::runtime::Runtime;
-use tokio::sync::mpsc::{self, Sender};
+use tokio::sync::mpsc;
 use tonic::transport::Channel;
 use tower::timeout::Timeout;
 use trace::{debug, error, info};
+use tskv::query_iterator::TskvSourceMetrics;
 use tskv::EngineRef;
 
 use crate::errors::*;
 use crate::hh_queue::HintedOffManager;
 use crate::metrics::LPReporter;
-use crate::reader::{QueryExecutor, ReaderIterator};
+use crate::reader::replica_selection::{DynamicReplicaSelectioner, DynamicReplicaSelectionerRef};
+use crate::reader::table_scan::vnode_opener::TemporaryVnodeOpener;
+use crate::reader::tag_scan::opener::TemporaryTagScanOpener;
+use crate::reader::CheckedCoordinatorRecordBatchStream;
 use crate::writer::PointWriter;
 use crate::{
-    status_response_to_result, Coordinator, QueryOption, VnodeManagerCmdType, WriteRequest,
+    status_response_to_result, Coordinator, QueryOption, SendableCoordinatorRecordBatchStream,
+    VnodeManagerCmdType, WriteRequest,
 };
 
 pub type CoordinatorRef = Arc<dyn Coordinator>;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CoordService {
     node_id: u64,
     meta: MetaRef,
@@ -45,6 +51,8 @@ pub struct CoordService {
     kv_inst: Option<EngineRef>,
     writer: Arc<PointWriter>,
     metrics: Arc<CoordServiceMetrics>,
+
+    replica_selectioner: DynamicReplicaSelectionerRef,
 }
 
 #[derive(Debug)]
@@ -93,6 +101,7 @@ impl CoordService {
         let hh_manager = Arc::new(HintedOffManager::new(handoff_cfg, point_writer.clone()).await);
         tokio::spawn(HintedOffManager::write_handoff_job(hh_manager, hh_receiver));
 
+        let replica_selectioner = Arc::new(DynamicReplicaSelectioner::new(meta_manager.clone()));
         let coord = Arc::new(Self {
             runtime,
             kv_inst,
@@ -100,6 +109,7 @@ impl CoordService {
             meta: meta_manager,
             writer: point_writer,
             metrics: Arc::new(CoordServiceMetrics::new(metrics_register.as_ref())),
+            replica_selectioner,
         });
 
         tokio::spawn(CoordService::db_ttl_service(coord.clone()));
@@ -207,105 +217,6 @@ impl CoordService {
         }
     }
 
-    async fn select_statement_request(
-        self,
-        option: QueryOption,
-        sender: Sender<CoordinatorResult<RecordBatch>>,
-    ) {
-        if self
-            .check_query_limiter(&option, sender.clone())
-            .await
-            .not()
-        {
-            return;
-        }
-        let executor = QueryExecutor::new(
-            option,
-            self.runtime.clone(),
-            self.kv_inst.clone(),
-            self.meta.clone(),
-            sender.clone(),
-            self.metrics.clone(),
-        );
-
-        let now = tokio::time::Instant::now();
-        debug!("select statement execute now: {:?}", now);
-
-        if let Err(err) = executor.execute().await.map(|_| {
-            debug!(
-                "select statement execute success, start at: {:?} elapsed: {:?}",
-                now,
-                now.elapsed(),
-            );
-        }) {
-            if sender.is_closed() {
-                return;
-            }
-            debug!("select statement execute failed: {}", err.to_string());
-            let _ = sender.send(Err(err)).await;
-        }
-    }
-
-    // if success return true
-    async fn check_query_limiter(
-        &self,
-        option: &QueryOption,
-        sender: Sender<CoordinatorResult<RecordBatch>>,
-    ) -> bool {
-        let tenant = option.table_schema.tenant.as_str();
-
-        if let Err(e) = self
-            .meta
-            .tenant_manager()
-            .limiter(tenant)
-            .await
-            .check_query()
-            .await
-            .map_err(|e| CoordinatorError::Meta { source: e })
-        {
-            let _ = sender.send(Err(e)).await;
-            false
-        } else {
-            true
-        }
-    }
-
-    async fn tag_scan_request(
-        self,
-        option: QueryOption,
-        sender: Sender<CoordinatorResult<RecordBatch>>,
-    ) {
-        if self
-            .check_query_limiter(&option, sender.clone())
-            .await
-            .not()
-        {
-            return;
-        }
-        let executor = QueryExecutor::new(
-            option,
-            self.runtime.clone(),
-            self.kv_inst.clone(),
-            self.meta.clone(),
-            sender.clone(),
-            self.metrics.clone(),
-        );
-
-        let now = tokio::time::Instant::now();
-        debug!("select statement execute now: {:?}", now);
-
-        if let Err(err) = executor.tag_scan().await.map(|_| {
-            debug!(
-                "select statement execute success, start at: {:?} elapsed: {:?}",
-                now,
-                now.elapsed(),
-            );
-        }) {
-            debug!("select statement execute failed: {}", err.to_string());
-            let _ = sender.send(Err(err)).await;
-        }
-    }
-
     async fn exec_admin_command_on_node(
         &self,
         node_id: u64,
@@ -320,6 +231,43 @@ impl CoordService {
 
         let response = client.exec_admin_command(request).await?.into_inner();
         status_response_to_result(&response)
+    }
+
+    /// 从kv引擎读取数据，流式返回结果
+    pub fn vnode_opener(
+        &self,
+        metrics: TskvSourceMetrics,
+    ) -> Result<TemporaryVnodeOpener, CoordinatorError> {
+        let opener = TemporaryVnodeOpener::new(
+            self.kv_inst.clone(),
+            self.runtime.clone(),
+            self.meta.clone(),
+            metrics,
+            self.metrics.clone(),
+        );
+
+        Ok(opener)
+    }
+
+    async fn prune_shards(
+        &self,
+        table: &ResolvedTable,
+        time_ranges: &TimeRanges,
+    ) -> Result<Vec<ReplicationSet>, CoordinatorError> {
+        let tenant = table.tenant();
+        let database = table.database();
+        let meta = self
+            .meta_manager()
+            .tenant_manager()
+            .tenant_meta(tenant)
+            .await
+            .ok_or(CoordinatorError::TenantNotFound {
+                name: tenant.to_string(),
+            })?;
+        let buckets = meta.mapping_bucket(database, time_ranges.min_ts(), time_ranges.max_ts())?;
+        let shards = buckets.into_iter().flat_map(|b| b.shard_group).collect();
+
+        Ok(shards)
     }
 }
 
@@ -340,6 +288,21 @@ impl Coordinator for CoordService {
 
     async fn tenant_meta(&self, tenant: &str) -> Option<MetaClientRef> {
         self.meta.tenant_manager().tenant_meta(tenant).await
+    }
+
+    async fn table_vnodes(
+        &self,
+        table: &ResolvedTable,
+        predicate: ResolvedPredicateRef,
+    ) -> CoordinatorResult<Vec<VnodeInfo>> {
+        // 1. 根据传入的过滤条件获取表的分片信息（包括副本）
+        let shards = self
+            .prune_shards(table, predicate.time_ranges().as_ref())
+            .await?;
+        // 2. 选择最优的副本
+        let optimal_shards = self.replica_selectioner.select(shards);
+
+        Ok(optimal_shards)
     }
 
     async fn write_points(
@@ -384,22 +347,65 @@ impl Coordinator for CoordService {
         res
     }
 
-    fn read_record(&self, option: QueryOption) -> CoordinatorResult<ReaderIterator> {
-        let (iterator, sender) = ReaderIterator::new();
+    fn read_record(
+        &self,
+        option: QueryOption,
+        metrics: TskvSourceMetrics,
+    ) -> CoordinatorResult<SendableCoordinatorRecordBatchStream> {
+        let tenant = option.table_schema.tenant.clone();
+        let tenant_manager = self.meta.tenant_manager();
+        let checker = async move {
+            tenant_manager
+                .limiter(&tenant)
+                .await
+                .check_query()
+                .await
+                .map_err(CoordinatorError::from)
+        };
 
-        let coord = self.clone();
-        tokio::spawn(CoordService::select_statement_request(
-            coord, option, sender,
-        ));
+        // TODO remove split from option
+        let vnode = option.split.vnode();
+        let opener = self.vnode_opener(metrics)?;
 
-        Ok(iterator)
+        Ok(Box::pin(CheckedCoordinatorRecordBatchStream::new(
+            vnode.clone(),
+            option,
+            opener,
+            Box::pin(checker),
+        )))
     }
 
-    fn tag_scan(&self, option: QueryOption) -> CoordinatorResult<ReaderIterator> {
-        let (iterator, sender) = ReaderIterator::new();
-        let coord = self.clone();
-        tokio::spawn(CoordService::tag_scan_request(coord, option, sender));
-        Ok(iterator)
+    fn tag_scan(
+        &self,
+        option: QueryOption,
+        metrics: TskvSourceMetrics,
+    ) -> CoordinatorResult<SendableCoordinatorRecordBatchStream> {
+        let tenant = option.table_schema.tenant.clone();
+        let tenant_manager = self.meta.tenant_manager();
+        let checker = async move {
+            tenant_manager
+                .limiter(&tenant)
+                .await
+                .check_query()
+                .await
+                .map_err(CoordinatorError::from)
+        };
+
+        // TODO remove split from option
+        let vnode = option.split.vnode();
+        let opener = TemporaryTagScanOpener::new(
+            self.kv_inst.clone(),
+            self.meta.clone(),
+            metrics,
+            self.metrics.clone(),
+        );
+
+        Ok(Box::pin(CheckedCoordinatorRecordBatchStream::new(
+            vnode.clone(),
+            option,
+            opener,
+            Box::pin(checker),
+        )))
     }
 
     async fn broadcast_command(&self, req: AdminCommandRequest) -> CoordinatorResult<()> {

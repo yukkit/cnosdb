@@ -250,6 +250,54 @@ impl From<flatbuffers::InvalidFlatbuffer> for CoordinatorError {
 
 pub type CoordinatorResult<T> = Result<T, CoordinatorError>;
 
+// default conversion from CoordinatorError to tonic treats everything
+// other than `Status` as an internal error
+impl From<CoordinatorError> for tonic::Status {
+    fn from(value: CoordinatorError) -> Self {
+        match value {
+            CoordinatorError::TskvError { source } => tonic::Status::internal(source.to_string()),
+            CoordinatorError::Meta { source } => tonic::Status::internal(source.to_string()),
+            CoordinatorError::ArrowError { source } => tonic::Status::internal(source.to_string()),
+            CoordinatorError::ModelsError { source } => tonic::Status::internal(source.to_string()),
+            CoordinatorError::InvalidFlatbuffer { source } => {
+                tonic::Status::internal(source.to_string())
+            }
+            CoordinatorError::FBPoints { source } => tonic::Status::internal(source.to_string()),
+            err @ CoordinatorError::MetaRequest { .. } => tonic::Status::internal(err.to_string()),
+            err @ CoordinatorError::IOErrors { .. } => tonic::Status::internal(err.to_string()),
+            err @ CoordinatorError::InvalidSerdeMsg { .. } => {
+                tonic::Status::internal(err.to_string())
+            }
+            err @ CoordinatorError::ChannelSend { .. } => tonic::Status::internal(err.to_string()),
+            err @ CoordinatorError::ChannelRecv { .. } => tonic::Status::internal(err.to_string()),
+            err @ CoordinatorError::WriteVnode { .. } => tonic::Status::internal(err.to_string()),
+            err @ CoordinatorError::TenantNotFound { .. } => {
+                tonic::Status::internal(err.to_string())
+            }
+            err @ CoordinatorError::UnKnownCoordCmd { .. } => {
+                tonic::Status::internal(err.to_string())
+            }
+            err @ CoordinatorError::CoordCommandParseErr => {
+                tonic::Status::internal(err.to_string())
+            }
+            err @ CoordinatorError::UnExpectResponse => tonic::Status::internal(err.to_string()),
+            err @ CoordinatorError::CommonError { .. } => tonic::Status::internal(err.to_string()),
+            err @ CoordinatorError::VnodeNotFound { .. } => {
+                tonic::Status::internal(err.to_string())
+            }
+            err @ CoordinatorError::FailoverNode { .. } => tonic::Status::internal(err.to_string()),
+            err @ CoordinatorError::RequestTimeout { .. } => {
+                tonic::Status::internal(err.to_string())
+            }
+            err @ CoordinatorError::KvInstanceNotFound { .. } => {
+                tonic::Status::internal(err.to_string())
+            }
+            err @ CoordinatorError::GRPCRequest { .. } => tonic::Status::internal(err.to_string()),
+            err @ CoordinatorError::Points { .. } => tonic::Status::internal(err.to_string()),
+        }
+    }
+}
+
 #[test]
 fn test_mod_code() {
     let e = CoordinatorError::UnExpectResponse;
