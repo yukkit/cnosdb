@@ -18,7 +18,7 @@ use datafusion::physical_plan::Accumulator;
 use datafusion::scalar::ScalarValue;
 use rand::Rng;
 use spi::query::function::FunctionMetadataManager;
-use spi::Result;
+use spi::{QueryError, Result};
 
 use super::SAMPLE_UDAF_NAME;
 use crate::extension::expr::{BINARYS, INTEGERS};
@@ -182,17 +182,27 @@ impl SampleAccumulator {
 
         let total_num = states.iter().map(|(e, _)| e.len()).sum::<usize>();
 
-        let mut sample_n = 0;
         let mut result = vec![];
 
-        for (s, r) in states {
-            sample_n = *r;
+        let sample_n = states.first().map(|(_, n)| *n).ok_or_else(|| {
+            DataFusionError::External(Box::new(QueryError::Internal {
+                reason: "The state of SampleAccumulator is empty".to_string(),
+            }))
+        })?;
+
+        let mut remain = sample_n;
+        for (s, _) in states {
+            if remain == 0 {
+                break;
+            }
+
             let num = s.len();
-            let select_num = (num * sample_n + sample_n - 1) / total_num;
+            let select_num = (num * sample_n + total_num - 1) / total_num;
             let indices = generate_unique_random_numbers(select_num as u32, 0, num as u32);
             for i in indices {
                 result.push(s[i as usize].clone());
             }
+            remain -= select_num;
         }
 
         Ok((result, sample_n))
