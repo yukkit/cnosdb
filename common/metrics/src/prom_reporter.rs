@@ -173,6 +173,9 @@ impl<'a> Reporter for PromReporter<'a> {
             if family.get_metric().is_empty() {
                 return;
             }
+
+            trace::info!("reporting metrics: {:?}", family);
+
             match self.encoder.encode(&[family], self.buffer) {
                 Ok(_) => {}
                 Err(e) => error!(%e, "error encoding metric family"),

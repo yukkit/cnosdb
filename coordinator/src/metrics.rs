@@ -87,6 +87,7 @@ impl<'a> Reporter for LPReporter<'a> {
 
     fn stop(&mut self) {
         if let Some((lines, _name, _metrics_type)) = &self.current_measure {
+            trace::info!("lines: {:?}", lines);
             let lines = lines.iter().map(|l| l.to_line()).collect::<Vec<_>>();
             let points = parse_lines_to_points(self.db, &lines);
             self.points_buffer.push(points);
