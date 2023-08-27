@@ -427,16 +427,19 @@ impl FieldFileLocation {
         }
     }
 
-    pub async fn peek(&mut self) -> Result<Option<DataType>> {
-        // Check if we need to init.
+    pub fn peek(&self) -> DataType {
+        self.data_block.get(self.data_block_i).expect("peek data")
+    }
+
+    pub async fn has_next(&mut self) -> Result<bool> {
         if self.data_block_i > self.data_block_i_end
             && !self.next_intersected_index_range()
             && !self.next_data_block().await?
         {
-            return Ok(None);
+            return Ok(false);
         }
 
-        Ok(self.data_block.get(self.data_block_i))
+        Ok(true)
     }
 
     pub fn next(&mut self) {
@@ -553,11 +556,15 @@ impl Cursor for TimeCursor {
 //-----------Tag Cursor----------------
 pub struct TagCursor {
     name: String,
-    value: Option<Vec<u8>>,
+    value: Option<DataType>,
 }
 
 impl TagCursor {
     pub fn new(name: String, value: Option<Vec<u8>>) -> Self {
+        let value = match value {
+            Some(value) => Some(DataType::Str(0, MiniVec::from(value.as_slice()))),
+            None => None,
+        };
         Self { name, value }
     }
 }
@@ -575,10 +582,44 @@ impl Cursor for TagCursor {
     async fn next(&mut self, _ts: i64) {}
 
     async fn peek(&mut self) -> Result<Option<DataType>> {
-        match &self.value {
-            Some(value) => Ok(Some(DataType::Str(0, MiniVec::from(value.as_slice())))),
-            None => Ok(None),
+        Ok(self.value.clone())
+    }
+}
+
+struct LevelIterator {
+    // sort by time, early -> late
+    locations: Vec<FieldFileLocation>,
+    idx: usize,
+}
+
+impl LevelIterator {
+    fn new(locations: Vec<FieldFileLocation>) -> Self {
+        Self { locations, idx: 0 }
+    }
+
+    fn push(&mut self, loc: FieldFileLocation) {
+        self.locations.push(loc);
+    }
+
+    pub async fn has_next(&mut self) -> Result<bool> {
+        while self.idx < self.locations.len() {
+            if self.locations[self.idx].has_next().await? {
+                return Ok(true);
+            }
+
+            self.idx += 1;
         }
+
+        Ok(false)
+    }
+
+    fn peek(&self) -> DataType {
+        self.locations[self.idx].peek()
+    }
+
+    fn next(&mut self) -> Result<()> {
+        self.locations[self.idx].next();
+        Ok(())
     }
 }
 
@@ -590,6 +631,7 @@ pub struct FieldCursor {
     cache_index: usize,
     cache_data: Vec<DataType>,
     locations: Vec<FieldFileLocation>,
+    iter: LevelIterator,
 }
 
 impl FieldCursor {
@@ -600,6 +642,7 @@ impl FieldCursor {
             cache_index: 0,
             cache_data: Vec::new(),
             locations: Vec::new(),
+            iter: LevelIterator::new(vec![]),
         }
     }
 
@@ -632,10 +675,18 @@ impl Cursor for FieldCursor {
     async fn peek(&mut self) -> Result<Option<DataType>> {
         let mut data = DataType::new(self.value_type, i64::MAX);
         for loc in self.locations.iter_mut() {
-            if let Some(val) = loc.peek().await? {
+            if loc.has_next().await? {
+                let val = loc.peek();
                 if data.timestamp() >= val.timestamp() {
                     data = val;
                 }
+            }
+        }
+
+        if self.iter.has_next().await? {
+            let val = self.iter.peek();
+            if data.timestamp() >= val.timestamp() {
+                data = val;
             }
         }
 
@@ -659,11 +710,14 @@ impl Cursor for FieldCursor {
         }
 
         for loc in self.locations.iter_mut() {
-            if let Some(val) = loc.peek().await.unwrap() {
-                if val.timestamp() == ts {
-                    loc.next();
-                }
+            let val = loc.peek();
+            if val.timestamp() == ts {
+                loc.next();
             }
+        }
+
+        if self.iter.peek().timestamp() == ts {
+            self.iter.next().unwrap();
         }
     }
 
@@ -1194,7 +1248,43 @@ impl SeriesGroupRowIterator {
         // Get data from level info, find time range overlapped files and file locations.
         // TODO: Init locations in parallel with other fields.
         let mut locations = vec![];
-        for level in super_version.version.levels_info.iter().rev() {
+        let level = &super_version.version.levels_info[0];
+        if time_ranges_ref.overlaps(&level.time_range) {
+            for file in level.files.iter() {
+                if !time_ranges_ref.overlaps(file.time_range()) || !file.contains_field_id(field_id)
+                {
+                    continue;
+                }
+                let path = file.file_path();
+                debug!(
+                    "Building FieldCursor: field: {:02X}, path: '{}'",
+                    field_id,
+                    path.display()
+                );
+
+                // too expensive
+                // if !path.is_file() {
+                //     return Err(Error::TsmFileBroken {
+                //         source: crate::tsm::ReadTsmError::FileNotFound {
+                //             reason: format!("File Not Found: {}", path.display()),
+                //         },
+                //     });
+                // }
+
+                let tsm_reader = super_version.version.get_tsm_reader(path).await?;
+                for idx_meta in tsm_reader.index_iterator_opt(field_id) {
+                    let location = FieldFileLocation::new(
+                        tsm_reader.clone(),
+                        time_ranges_ref.clone(),
+                        idx_meta.block_iterator_opt(time_ranges_ref.clone()),
+                        field_type,
+                    );
+                    locations.push(location);
+                }
+            }
+        }
+        let mut iter = LevelIterator::new(vec![]);
+        for level in super_version.version.levels_info.iter().skip(1).rev() {
             if !time_ranges_ref.overlaps(&level.time_range) {
                 continue;
             }
@@ -1210,13 +1300,14 @@ impl SeriesGroupRowIterator {
                     path.display()
                 );
 
-                if !path.is_file() {
-                    return Err(Error::TsmFileBroken {
-                        source: crate::tsm::ReadTsmError::FileNotFound {
-                            reason: format!("File Not Found: {}", path.display()),
-                        },
-                    });
-                }
+                // too expensive
+                // if !path.is_file() {
+                //     return Err(Error::TsmFileBroken {
+                //         source: crate::tsm::ReadTsmError::FileNotFound {
+                //             reason: format!("File Not Found: {}", path.display()),
+                //         },
+                //     });
+                // }
 
                 let tsm_reader = super_version.version.get_tsm_reader(path).await?;
                 for idx_meta in tsm_reader.index_iterator_opt(field_id) {
@@ -1226,7 +1317,7 @@ impl SeriesGroupRowIterator {
                         idx_meta.block_iterator_opt(time_ranges_ref.clone()),
                         field_type,
                     );
-                    locations.push(location);
+                    iter.push(location);
                 }
             }
         }
@@ -1239,13 +1330,12 @@ impl SeriesGroupRowIterator {
             cache_index: 0,
             cache_data,
             locations,
+            iter,
         })
     }
 
     async fn collect_row_data(&mut self, builder: &mut [ArrayBuilderPtr]) -> Result<Option<()>> {
         trace::trace!("======collect_row_data=========");
-        // Record elapsed_field_scan
-        let timer = self.metrics.elapsed_field_scan().timer();
 
         let mut min_time = i64::MAX;
         let mut row_cols = Vec::with_capacity(self.columns.len());
@@ -1281,8 +1371,6 @@ impl SeriesGroupRowIterator {
             }
         }
 
-        // Step field_scan completed.
-        timer.done();
         trace::trace!(
             "Collected data, series_id: {}, column count: {test_collected_col_num}, timestamp: {min_time}",
             self.series_ids[self.i - 1],
@@ -1292,9 +1380,6 @@ impl SeriesGroupRowIterator {
             self.columns.clear();
             return Ok(None);
         }
-
-        // Record elapsed_point_to_record_batch
-        let timer = self.metrics.elapsed_point_to_record_batch().timer();
 
         for (i, value) in row_cols.into_iter().enumerate() {
             match self.columns[i].column_type() {
@@ -1309,8 +1394,6 @@ impl SeriesGroupRowIterator {
                 }
             }
         }
-
-        timer.done();
 
         Ok(Some(()))
     }
