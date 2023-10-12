@@ -197,6 +197,7 @@ impl DMLPlan {
     }
 }
 
+/// TODO implement UserDefinedLogicalNodeCore
 #[derive(Debug, Clone)]
 pub struct DeleteFromTable {
     pub table_name: ResolvedTable,
