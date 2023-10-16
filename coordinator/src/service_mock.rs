@@ -157,6 +157,18 @@ impl Coordinator for MockCoordinator {
         todo!()
     }
 
+    async fn exec_delete_from_replica(
+        &self,
+        replica: &ReplicationSet,
+        tenant: &str,
+        database: &str,
+        table: &str,
+        predicate: &ResolvedPredicate,
+        span_ctx: Option<&SpanContext>,
+    ) -> CoordinatorResult<()> {
+        Ok(())
+    }
+
     async fn write_lines<'a>(
         &self,
         tenant: &str,
@@ -198,6 +210,7 @@ impl Coordinator for MockCoordinator {
         &self,
         table: &ResolvedTable,
         predicate: &ResolvedPredicate,
+        span_ctx: Option<&SpanContext>,
     ) -> CoordinatorResult<()> {
         todo!("delete_from_table")
     }

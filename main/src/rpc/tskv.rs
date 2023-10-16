@@ -513,6 +513,57 @@ impl TskvService for TskvServiceImpl {
         }
     }
 
+    async fn delete_from_replica(
+        &self,
+        request: tonic::Request<DeleteFromReplicaRequest>,
+    ) -> Result<tonic::Response<StatusResponse>, tonic::Status> {
+        let span = get_span_recorder(request.extensions(), "grpc delete_from_replica");
+        let inner = request.into_inner();
+
+        let client = self
+            .coord
+            .tenant_meta(&inner.tenant)
+            .await
+            .ok_or(tonic::Status::new(
+                tonic::Code::Internal,
+                format!("Not Found tenant({}) meta", inner.tenant),
+            ))?;
+
+        let replica = client
+            .get_replication_set(inner.replica_id)
+            .ok_or(tonic::Status::new(
+                tonic::Code::Internal,
+                format!("Not Found Replica Set({})", inner.replica_id),
+            ))?;
+
+        let predicate =
+            bincode::deserialize::<ResolvedPredicate>(&inner.predicate).map_err(|err| {
+                TskvError::InvalidParam {
+                    reason: format!(
+                        "Error parsing ResolvedPredicate when call delete_from_replica, error: {}",
+                        err
+                    ),
+                }
+            })?;
+
+        if let Err(err) = self
+            .coord
+            .exec_delete_from_replica(
+                &replica,
+                &inner.tenant,
+                &inner.db_name,
+                &inner.table,
+                &predicate,
+                span.span_ctx(),
+            )
+            .await
+        {
+            self.status_response(FAILED_RESPONSE_CODE, err.to_string())
+        } else {
+            self.status_response(SUCCESS_RESPONSE_CODE, "".to_string())
+        }
+    }
+
     async fn exec_open_raft_node(
         &self,
         request: tonic::Request<OpenRaftNodeRequest>,

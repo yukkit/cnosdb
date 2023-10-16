@@ -394,6 +394,20 @@ pub struct WriteReplicaRequest {
     #[prost(bytes = "vec", tag = "5")]
     pub data: ::prost::alloc::vec::Vec<u8>,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DeleteFromReplicaRequest {
+    #[prost(uint32, tag = "1")]
+    pub replica_id: u32,
+    #[prost(string, tag = "2")]
+    pub tenant: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub db_name: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub table: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "5")]
+    pub predicate: ::prost::alloc::vec::Vec<u8>,
+}
 /// Generated client implementations.
 pub mod tskv_service_client {
     #![allow(unused_variables, dead_code, missing_docs, clippy::let_unit_value)]
@@ -571,6 +585,28 @@ pub mod tskv_service_client {
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("kv_service.TSKVService", "WriteReplicaPoints"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn delete_from_replica(
+            &mut self,
+            request: impl tonic::IntoRequest<super::DeleteFromReplicaRequest>,
+        ) -> std::result::Result<tonic::Response<super::StatusResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/kv_service.TSKVService/DeleteFromReplica",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("kv_service.TSKVService", "DeleteFromReplica"));
             self.inner.unary(req, path, codec).await
         }
         pub async fn query_record_batch(
@@ -873,6 +909,10 @@ pub mod tskv_service_server {
         async fn write_replica_points(
             &self,
             request: tonic::Request<super::WriteReplicaRequest>,
+        ) -> std::result::Result<tonic::Response<super::StatusResponse>, tonic::Status>;
+        async fn delete_from_replica(
+            &self,
+            request: tonic::Request<super::DeleteFromReplicaRequest>,
         ) -> std::result::Result<tonic::Response<super::StatusResponse>, tonic::Status>;
         /// Server streaming response type for the QueryRecordBatch method.
         type QueryRecordBatchStream: futures_core::Stream<
@@ -1203,6 +1243,52 @@ pub mod tskv_service_server {
                     let fut = async move {
                         let inner = inner.0;
                         let method = WriteReplicaPointsSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/kv_service.TSKVService/DeleteFromReplica" => {
+                    #[allow(non_camel_case_types)]
+                    struct DeleteFromReplicaSvc<T: TskvService>(pub Arc<T>);
+                    impl<
+                        T: TskvService,
+                    > tonic::server::UnaryService<super::DeleteFromReplicaRequest>
+                    for DeleteFromReplicaSvc<T> {
+                        type Response = super::StatusResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::DeleteFromReplicaRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                (*inner).delete_from_replica(request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let inner = inner.0;
+                        let method = DeleteFromReplicaSvc(inner);
                         let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

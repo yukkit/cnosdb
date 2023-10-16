@@ -233,6 +233,13 @@ message WriteReplicaRequest {
     bytes data = 5;
 }
 
+message DeleteFromReplicaRequest {
+    uint32 replica_id = 1;
+    string tenant = 2;
+    string db_name = 3;
+    string table = 4;
+    bytes predicate = 5;
+}
 
 /* -------------------------------------------------------------------- */
 service TSKVService {
@@ -241,6 +248,7 @@ service TSKVService {
 
   rpc WriteVnodePoints(WriteVnodeRequest) returns (StatusResponse) {};
   rpc WriteReplicaPoints(WriteReplicaRequest) returns (StatusResponse) {};
+  rpc DeleteFromReplica(DeleteFromReplicaRequest) returns (StatusResponse) {};
   rpc QueryRecordBatch(QueryRecordBatchRequest) returns (stream BatchBytesResponse) {};
   rpc ExecAdminCommand(AdminCommandRequest) returns (StatusResponse) {};
   rpc ExecAdminFetchCommand(AdminFetchCommandRequest) returns (BatchBytesResponse) {};

@@ -18,6 +18,7 @@ use datafusion::arrow::array::{
 use datafusion::arrow::compute::take;
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
+use futures::FutureExt;
 use meta::error::MetaError;
 use meta::model::{MetaClientRef, MetaRef};
 use metrics::count::U64Counter;
@@ -534,8 +535,36 @@ impl Coordinator for CoordService {
         replica: ReplicationSet,
         span_ctx: Option<&SpanContext>,
     ) -> CoordinatorResult<()> {
+        let request = WriteReplicaRequest {
+            replica_id: replica.id,
+            tenant: tenant.to_string(),
+            db_name: db_name.to_string(),
+            precision: precision as u32,
+            data: Arc::unwrap_or_clone(data.clone()),
+        };
         self.raft_writer
-            .write_to_local_or_forward(data, tenant, db_name, precision, &replica, span_ctx)
+            .write_to_local_or_forward(request, tenant, db_name, &replica, span_ctx)
+            .await
+    }
+
+    async fn exec_delete_from_replica(
+        &self,
+        replica: &ReplicationSet,
+        tenant: &str,
+        database: &str,
+        table: &str,
+        predicate: &ResolvedPredicate,
+        span_ctx: Option<&SpanContext>,
+    ) -> CoordinatorResult<()> {
+        let request = DeleteFromReplicaRequest {
+            replica_id: replica.id,
+            tenant: tenant.to_string(),
+            db_name: database.to_string(),
+            table: table.to_string(),
+            predicate: bincode::serialize(&predicate)?,
+        };
+        self.raft_writer
+            .delete_on_local_or_forward(request, tenant, database, replica, span_ctx)
             .await
     }
 
@@ -769,6 +798,7 @@ impl Coordinator for CoordService {
         &self,
         table: &ResolvedTable,
         predicate: &ResolvedPredicate,
+        span_ctx: Option<&SpanContext>,
     ) -> CoordinatorResult<()> {
         let nodes = self.meta.data_nodes().await;
 
@@ -781,22 +811,40 @@ impl Coordinator for CoordService {
             .await?;
 
         let now = tokio::time::Instant::now();
-        let mut requests = vec![];
-
+        let mut requests: Vec<Pin<Box<dyn Future<Output = Result<(), CoordinatorError>> + Send>>> =
+            Vec::new();
         if self.using_raft_replication() {
             // TODO
-            return Err(CoordinatorError::CommonError {
-                msg: "Not support delete table use raft api".to_string(),
-            });
+            for vnode in &vnodes {
+                let span_recorder = SpanRecorder::new(
+                    span_ctx.child_span(format!("delete from table on replica {}", vnode.id)),
+                );
+                requests.push(
+                    self.raft_writer
+                        .delete_from_table_on_replica(
+                            vnode,
+                            table.tenant(),
+                            table.database(),
+                            table.table(),
+                            predicate,
+                            span_recorder,
+                        )
+                        .boxed(),
+                );
+            }
         } else {
             for vnode in vnodes.into_iter().flat_map(|v| v.vnodes) {
-                requests.push(self.point_writer.delete_from_table_on_vnode(
-                    vnode,
-                    table.tenant(),
-                    table.database(),
-                    table.table(),
-                    predicate,
-                ));
+                requests.push(
+                    self.point_writer
+                        .delete_from_table_on_vnode(
+                            vnode,
+                            table.tenant(),
+                            table.database(),
+                            table.table(),
+                            predicate,
+                        )
+                        .boxed(),
+                );
             }
         }
 

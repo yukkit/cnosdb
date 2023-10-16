@@ -1287,6 +1287,7 @@ dependencies = [
  "metrics",
  "models",
  "openraft",
+ "prost",
  "protocol_parser",
  "protos",
  "rand",

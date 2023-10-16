@@ -100,6 +100,16 @@ pub trait Coordinator: Send + Sync {
         span_ctx: Option<&SpanContext>,
     ) -> CoordinatorResult<()>;
 
+    async fn exec_delete_from_replica(
+        &self,
+        replica: &ReplicationSet,
+        tenant: &str,
+        database: &str,
+        table: &str,
+        predicate: &ResolvedPredicate,
+        span_ctx: Option<&SpanContext>,
+    ) -> CoordinatorResult<()>;
+
     async fn write_lines<'a>(
         &self,
         tenant: &str,
@@ -132,6 +142,7 @@ pub trait Coordinator: Send + Sync {
         &self,
         table: &ResolvedTable,
         predicate: &ResolvedPredicate,
+        span_ctx: Option<&SpanContext>,
     ) -> CoordinatorResult<()>;
 
     async fn broadcast_command(&self, req: AdminCommandRequest) -> CoordinatorResult<()>;

@@ -44,7 +44,7 @@ impl DMLDefinitionTask for DeleteFromTableTask {
 
         query_state_machine
             .coord
-            .delete_from_table(table_name, &predicate)
+            .delete_from_table(table_name, &predicate, None)
             .await?;
 
         Ok(Output::Nil(()))
