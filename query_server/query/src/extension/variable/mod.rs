@@ -1,3 +1,5 @@
+mod server_version;
+
 use spi::query::variable::SystemVariableManager;
 use spi::Result;
 
