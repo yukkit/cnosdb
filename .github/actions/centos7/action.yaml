@@ -1,0 +1,73 @@
+name: Prepare Rust for Centos7
+description: 'Prepare Rust Build Environment'
+runs:
+  using: "composite"
+  steps:
+    - name: Prepare Enviroments
+      shell: bash
+      run: |
+        # Installing unzip zip
+        yum install -y unzip zip
+
+        # Installing openssl
+        yum -y install perl-IPC-Cmd
+        yum -y install openssl openssl-devel
+
+        # Installing wget
+        yum -y install wget
+    - name: Install GCC
+      shell: bash
+      run: |
+        # Installing Development Tools
+        yum group install -y "Development Tools"
+        gcc --version
+    - name: Install clang
+      shell: bash
+      run: |
+        yum install clang -y
+        clang --version
+    - name: Install cmake
+      shell: bash
+      run: |
+        cmake_pkg="cmake-3.26.5-linux-x86_64"
+        wget https://github.com/Kitware/CMake/releases/download/v3.26.5/${cmake_pkg}.tar.gz && \
+        tar -zxf ${cmake_pkg}.tar.gz && \
+        cd ${cmake_pkg}/bin && \
+        ln -s `pwd`/cmake /usr/bin/cmake
+    - name: Install flatbuffers
+      shell: bash
+      run: |
+        flatc_version="v22.9.29"
+        mkdir -p /tmp/flatbuffers && cd /tmp/flatbuffers
+        git clone -b ${flatc_version} --depth 1 https://github.com/google/flatbuffers.git && cd flatbuffers
+        CC=/usr/bin/clang CXX=/usr/bin/clang++ /usr/bin/cmake . -DCMAKE_BUILD_TYPE=Release -DFLATBUFFERS_CXX_FLAGS="-w"  && \
+        make && \
+        make install && \
+        flatc --version
+        cd - && rm -rf /tmp/flatbuffers
+    - name: Install protoc
+      shell: bash
+      run: |
+        protoc_version="v3.15.8"
+        mkdir -p /tmp/protobuf && cd /tmp/protobuf
+        git clone -b ${protoc_version} --depth 1 https://github.com/protocolbuffers/protobuf.git && cd protobuf
+        chmod +x autogen.sh
+        ./autogen.sh
+        chmod +x configure
+        ./configure -prefix=/usr/local/
+        make && make install
+        protoc --version
+        cd - && rm -rf /tmp/protobuf
+    - name: Disable incremental compilation
+      # Disable incremental compilation
+      shell: bash
+      run: echo "CARGO_INCREMENTAL=0" >> $GITHUB_ENV
+    - name: Install Rust
+      shell: bash
+      run: |
+        echo "Installing nightly"
+        curl -L https://sh.rustup.rs -o rustup-init && \
+        chmod +x rustup-init && \
+        ./rustup-init -y 
+        source "$HOME/.cargo/env"
+        rustc --version

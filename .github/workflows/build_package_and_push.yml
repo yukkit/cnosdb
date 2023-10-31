@@ -18,15 +18,14 @@ env:
 
 jobs:
   build:
-    env:
-      SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: "sccache"
     strategy:
       matrix:
         target:
           - aarch64-unknown-linux-gnu
           - x86_64-unknown-linux-gnu
     runs-on: ubuntu-latest
+    container:
+      image: "centos:7"
     steps:
     - name: Get tag
       id: get-tag
@@ -36,17 +35,31 @@ jobs:
         else
           echo "TAG=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
         fi
-    - uses: actions/checkout@v3
-    - name: Prepare Rust Builder
-      uses: ./.github/actions/setup-builder
-    - name: Install build tools
+    - uses: actions/checkout@v1
+    - name: Prepare Rust for Centos7
+      uses: ./.github/actions/centos7
+    - name: Install fpm
       shell: bash
       run: |
-        sudo gem install fpm
+        yum install which -y
+        yum -y install ruby rubygems ruby-devel
+        curl -sSL https://rvm.io/pkuczynski.asc | gpg2 --import
+        curl -L http://get.rvm.io | bash -s stable
+        source /usr/local/rvm/scripts/rvm
+        rvm install 2.5.0
+        gem install fpm
     - name: Compiler
       run: |
+        source "$HOME/.cargo/env"
         if [[ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]]; then
-          sudo apt install gcc-aarch64-linux-gnu
+          # sudo apt install gcc-aarch64-linux-gnu
+          
+          # centos7
+          yum -y install epel-release \
+          && yum -y install gcc-aarch64-linux-gnu gcc-c++-aarch64-linux-gnu \
+          && yum install -y http://springdale.princeton.edu/data/springdale/7/x86_64/os/Computational/glibc-aarch64-linux-gnu-2.24-2.sdl7.2.noarch.rpm \
+          && yum install -y http://springdale.princeton.edu/data/springdale/7/x86_64/os/Computational/glibc-aarch64-linux-gnu-devel-2.24-2.sdl7.2.noarch.rpm 
+
           rustup target add aarch64-unknown-linux-gnu
           RUSTFLAGS="-C linker=aarch64-linux-gnu-gcc" cargo build --workspace --bins --release --target aarch64-unknown-linux-gnu
         else
